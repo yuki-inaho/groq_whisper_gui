@@ -1,0 +1,24 @@
+# Rust build artifacts
+/target/
+
+# User-provided fixtures and transient work area
+/data/
+/temp/
+
+# Local agent/operator files copied from templates
+/.claude/roles/
+/CLAUDE.md
+/CODEX.md
+
+# Local secrets. Keep `.env.example` tracked as documentation.
+.env
+.env.local
+
+# Logs and temporary editor/OS files
+*.log
+*.tmp
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
