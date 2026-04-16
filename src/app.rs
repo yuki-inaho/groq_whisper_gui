@@ -372,7 +372,7 @@ impl VoiceDeskApp {
             } = event
             {
                 if is_quit_key(key) {
-                    self.request_exit();
+                    self.request_exit(ctx);
                     break;
                 }
 
@@ -399,15 +399,28 @@ impl VoiceDeskApp {
         }
     }
 
-    fn request_exit(&mut self) {
-        self.show_exit_summary = true;
+    fn request_exit(&mut self, ctx: &egui::Context) {
+        if self.show_exit_summary {
+            self.confirm_exit(ctx);
+        } else {
+            self.show_exit_summary = true;
+        }
+    }
+
+    fn confirm_exit(&mut self, ctx: &egui::Context) {
+        self.exit_confirmed = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
     fn handle_close_request(&mut self, ctx: &egui::Context) {
         let close_requested = ctx.input(|input| input.viewport().close_requested());
         if close_requested && !self.exit_confirmed {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.show_exit_summary = true;
+            if self.show_exit_summary {
+                self.confirm_exit(ctx);
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.show_exit_summary = true;
+            }
         }
     }
 
@@ -645,11 +658,13 @@ impl VoiceDeskApp {
         }
 
         let mut open = true;
-        egui::Window::new("終了前の利用サマリ")
+        egui::Window::new("終了確認")
             .open(&mut open)
             .collapsible(false)
-            .resizable(true)
+            .resizable(false)
             .show(ctx, |ui| {
+                ui.label(egui::RichText::new("このまま終了しますか？").strong());
+                ui.add_space(6.0);
                 ui.add(egui::Label::new("この起動中に成功した Groq Whisper API 呼び出しの推定利用量です。Groq の音声文字起こしはトークンではなく音声時間ベースで課金されるため、料金は録音時間からの推定です。").wrap(true));
                 ui.add_space(6.0);
 
@@ -696,6 +711,8 @@ impl VoiceDeskApp {
 
                 ui.add_space(6.0);
                 ui.add(egui::Label::new("実際の請求額はクレジット、割引、価格変更、失敗リクエストの扱いにより異なる可能性があります。最終確認は Groq Console の Usage / Billing で行ってください。").wrap(true));
+                ui.add_space(6.0);
+                ui.add(egui::Label::new("このダイアログを開いた状態で Q または Esc をもう一度押しても終了できます。").wrap(true));
                 ui.add_space(8.0);
 
                 ui.horizontal(|ui| {
@@ -703,9 +720,8 @@ impl VoiceDeskApp {
                         self.show_exit_summary = false;
                     }
 
-                    if ui.button("終了").clicked() {
-                        self.exit_confirmed = true;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    if ui.button("終了する（Q / Esc）").clicked() {
+                        self.confirm_exit(ctx);
                     }
                 });
             });
