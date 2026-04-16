@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+const APP_DIR_NAME: &str = "groq-whisper-app";
+const LEGACY_APP_DIR_NAME: &str = "groq-whisper-desktop";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LastResultRecord {
     pub text_preview: String,
@@ -71,7 +74,7 @@ impl Default for StoredAppState {
 }
 
 pub fn load_state() -> Result<StoredAppState> {
-    let path = state_path()?;
+    let path = load_state_path()?;
     if !path.exists() {
         return Ok(StoredAppState::default());
     }
@@ -96,7 +99,23 @@ pub fn save_state(state: &StoredAppState) -> Result<()> {
 }
 
 pub fn state_path() -> Result<PathBuf> {
-    let project_dirs = ProjectDirs::from("com", "sandbox", "groq-whisper-desktop")
+    let project_dirs = ProjectDirs::from("com", "sandbox", APP_DIR_NAME)
         .context("failed to determine application data directory")?;
     Ok(project_dirs.config_dir().join("state.json"))
+}
+
+fn load_state_path() -> Result<PathBuf> {
+    let new_path = state_path()?;
+    if new_path.exists() {
+        return Ok(new_path);
+    }
+
+    let legacy_dirs = ProjectDirs::from("com", "sandbox", LEGACY_APP_DIR_NAME)
+        .context("failed to determine legacy application data directory")?;
+    let legacy_path = legacy_dirs.config_dir().join("state.json");
+    if legacy_path.exists() {
+        return Ok(legacy_path);
+    }
+
+    Ok(new_path)
 }

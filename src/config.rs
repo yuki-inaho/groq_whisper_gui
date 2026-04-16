@@ -13,6 +13,54 @@ pub const WHISPER_MODEL_V3: &str = "whisper-large-v3";
 pub const DEFAULT_MODEL: &str = WHISPER_MODEL_V3_TURBO;
 pub const DEFAULT_LANGUAGE: &str = "ja";
 
+const SHORT_ABOUT: &str = "Desktop push-to-transcribe client for Groq Whisper.";
+const LONG_ABOUT: &str = r#"groq-whisper-app records microphone audio, encodes it as MP3 or WAV, sends it to Groq's Whisper-compatible transcription API, and can copy the result to the clipboard.
+
+The app opens a native egui desktop window. CLI flags and matching environment variables configure startup defaults; settings changed inside the UI are persisted and reused on the next launch."#;
+const SHORT_AFTER_HELP: &str = r#"Run `groq-whisper-app --help` for examples, environment variables,
+persisted-setting behavior, encoder notes, and troubleshooting hints."#;
+const LONG_AFTER_HELP: &str = r#"Binary:
+  cargo run --release -- [OPTIONS]
+  groq-whisper-app [OPTIONS]
+
+Required:
+  GROQ_API_KEY or --api-key is required for transcription. Without it the app still opens, but API requests fail.
+
+Startup examples:
+  groq-whisper-app
+  groq-whisper-app --ui-mode debug --show-settings
+  groq-whisper-app --start-hotkey Ctrl+S --stop-hotkey Ctrl+E
+  groq-whisper-app --mp3-encoder lame --lame-path /usr/bin/lame
+  groq-whisper-app --mp3-encoder ffmpeg --ffmpeg-path /usr/bin/ffmpeg
+  groq-whisper-app --encoder-format wav --keep-audio
+  GROQ_API_KEY=gsk_xxx groq-whisper-app
+
+Configuration sources:
+  - CLI flags win for that launch.
+  - Environment variables provide process defaults.
+  - Some UI choices are persisted between launches: UI mode, input device, model, GPU offload, and hotkeys.
+  - `--word-timestamps` or `--segment-timestamps` forces `--response-format verbose-json`.
+
+Hotkeys:
+  - Default persisted hotkey is Space as a record toggle.
+  - Use either `--toggle-hotkey`, or both `--start-hotkey` and `--stop-hotkey`.
+  - Do not mix toggle mode with separate start/stop mode.
+
+Audio and encoding:
+  - Default encoder format is MP3.
+  - Default MP3 backend is `lame`; it streams raw PCM to the stand-alone `lame` binary.
+  - `--mp3-encoder ffmpeg` requires an ffmpeg build with `libmp3lame`.
+  - There is no implicit fallback between ffmpeg and lame. Choose the backend explicitly.
+  - Use `--encoder-format wav` to bypass MP3 encoding while debugging capture/API issues.
+  - `--ffmpeg-extra-arg` may be repeated and is appended to the ffmpeg command.
+
+Troubleshooting:
+  - API errors: verify `GROQ_API_KEY`, `--model`, `--base-url`, and network access.
+  - No microphone: check the system input device and use `--input-device` or the settings screen.
+  - lame launch errors: set `--lame-path` or `GROQ_LAME_PATH`.
+  - ffmpeg `Unknown encoder 'libmp3lame'`: rerun with `--mp3-encoder lame` or use a libmp3lame-enabled ffmpeg.
+  - Clipboard issues: rerun with `--disable-clipboard` and copy the text from Debug UI."#;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 pub enum UiMode {
     Compact,
@@ -119,100 +167,283 @@ impl ResponseFormat {
 
 #[derive(Debug, Clone, Parser)]
 #[command(
+    name = "groq-whisper-app",
     author,
     version,
-    about = "Standalone desktop transcriber for Groq Whisper API"
+    about = SHORT_ABOUT,
+    long_about = LONG_ABOUT,
+    after_help = SHORT_AFTER_HELP,
+    after_long_help = LONG_AFTER_HELP
 )]
 pub struct CliArgs {
     // clap は env 値を help に表示できるため、秘密値は変数名だけを出す。
-    #[arg(long, env = "GROQ_API_KEY", hide_env_values = true)]
+    #[arg(
+        long,
+        env = "GROQ_API_KEY",
+        hide_env_values = true,
+        help = "Groq API key for transcription requests",
+        long_help = "Groq API key for transcription requests.\n\nThe value can also be provided with GROQ_API_KEY. Help output intentionally shows only the environment variable name, not its current value."
+    )]
     pub api_key: Option<String>,
 
-    #[arg(long, env = "GROQ_BASE_URL")]
+    #[arg(
+        long,
+        env = "GROQ_BASE_URL",
+        hide_env_values = true,
+        help = "OpenAI-compatible API base URL",
+        long_help = "OpenAI-compatible API base URL.\n\nDefaults to https://api.groq.com/openai/v1 when neither the CLI flag nor GROQ_BASE_URL is set."
+    )]
     pub base_url: Option<String>,
 
-    #[arg(long, env = "GROQ_WHISPER_MODEL")]
+    #[arg(
+        long,
+        env = "GROQ_WHISPER_MODEL",
+        hide_env_values = true,
+        help = "Whisper model name to request",
+        long_help = "Whisper model name to request.\n\nDefaults to whisper-large-v3-turbo unless a persisted UI setting or GROQ_WHISPER_MODEL provides another value."
+    )]
     pub model: Option<String>,
 
-    #[arg(long, env = "GROQ_WHISPER_LANGUAGE", default_value = DEFAULT_LANGUAGE)]
+    #[arg(
+        long,
+        env = "GROQ_WHISPER_LANGUAGE",
+        hide_env_values = true,
+        default_value = DEFAULT_LANGUAGE,
+        help = "Language hint sent to Whisper",
+        long_help = "Language hint sent to Whisper.\n\nUse an ISO language code such as ja or en. The default is ja."
+    )]
     pub language: String,
 
     // プロンプトにも業務文脈や個人情報が入りうるので API key と同じ扱いにする。
-    #[arg(long, env = "GROQ_WHISPER_PROMPT", hide_env_values = true)]
+    #[arg(
+        long,
+        env = "GROQ_WHISPER_PROMPT",
+        hide_env_values = true,
+        help = "Optional Whisper prompt/context",
+        long_help = "Optional Whisper prompt/context.\n\nThe value can also be provided with GROQ_WHISPER_PROMPT. Help output intentionally shows only the environment variable name, not its current value."
+    )]
     pub prompt: Option<String>,
 
-    #[arg(long, value_enum, env = "GROQ_UI_MODE")]
+    #[arg(
+        long,
+        value_enum,
+        env = "GROQ_UI_MODE",
+        hide_env_values = true,
+        help = "Initial UI layout",
+        long_help = "Initial UI layout.\n\ncompact opens the small status-first UI. debug opens a larger window with transcript and diagnostic log panes. If omitted, the persisted UI choice is reused."
+    )]
     pub ui_mode: Option<UiMode>,
 
-    #[arg(long, env = "GROQ_INPUT_DEVICE")]
+    #[arg(
+        long,
+        env = "GROQ_INPUT_DEVICE",
+        hide_env_values = true,
+        help = "Input device name to use",
+        long_help = "Input device name to use.\n\nPass a name from the settings screen or system audio device list. If omitted, the persisted UI choice or system default input device is used."
+    )]
     pub input_device: Option<String>,
 
-    #[arg(long, value_enum, env = "GROQ_RESPONSE_FORMAT")]
+    #[arg(
+        long,
+        value_enum,
+        env = "GROQ_RESPONSE_FORMAT",
+        hide_env_values = true,
+        help = "Transcription response format",
+        long_help = "Transcription response format.\n\njson is the normal default. text requests plain text. verbose-json is required for timestamp details and is forced automatically by --word-timestamps or --segment-timestamps."
+    )]
     pub response_format: Option<ResponseFormat>,
 
-    #[arg(long, value_enum, env = "GROQ_ENCODER_FORMAT")]
+    #[arg(
+        long,
+        value_enum,
+        env = "GROQ_ENCODER_FORMAT",
+        hide_env_values = true,
+        help = "Audio format uploaded to Groq",
+        long_help = "Audio format uploaded to Groq.\n\nmp3 is the normal default. wav bypasses MP3 encoding and is useful when isolating encoder issues."
+    )]
     pub encoder_format: Option<EncoderFormat>,
 
     #[arg(
         long,
         value_enum,
         env = "GROQ_MP3_ENCODER",
+        hide_env_values = true,
         default_value_t = Mp3EncoderBackend::Lame,
+        help = "MP3 encoder backend",
+        long_help = "MP3 encoder backend.\n\nlame streams raw PCM to the stand-alone lame binary and is the default. ffmpeg requires an ffmpeg build with libmp3lame. There is no implicit fallback between backends.",
     )]
     pub mp3_encoder: Mp3EncoderBackend,
 
-    #[arg(long, env = "GROQ_LAME_PATH", default_value = "/usr/bin/lame")]
+    #[arg(
+        long,
+        env = "GROQ_LAME_PATH",
+        hide_env_values = true,
+        default_value = "/usr/bin/lame",
+        help = "Path to the stand-alone lame binary",
+        long_help = "Path to the stand-alone lame binary.\n\nUsed only when --mp3-encoder lame is selected."
+    )]
     pub lame_path: String,
 
-    #[arg(long, value_enum, env = "GROQ_GPU_OFFLOAD")]
+    #[arg(
+        long,
+        value_enum,
+        env = "GROQ_GPU_OFFLOAD",
+        hide_env_values = true,
+        help = "GPU offload mode for future/custom ffmpeg use",
+        long_help = "GPU offload mode for future/custom ffmpeg use.\n\nThe current audio-only pipeline is CPU-oriented. These values are persisted for explicit configuration and custom ffmpeg argument experiments."
+    )]
     pub gpu_offload: Option<GpuOffloadMode>,
 
-    #[arg(long, env = "GROQ_TOGGLE_HOTKEY")]
+    #[arg(
+        long,
+        env = "GROQ_TOGGLE_HOTKEY",
+        hide_env_values = true,
+        help = "Hotkey that toggles recording",
+        long_help = "Hotkey that toggles recording.\n\nExamples: Space, Ctrl+Space, Alt+R. Do not combine this with --start-hotkey/--stop-hotkey."
+    )]
     pub toggle_hotkey: Option<String>,
 
-    #[arg(long, env = "GROQ_START_HOTKEY")]
+    #[arg(
+        long,
+        env = "GROQ_START_HOTKEY",
+        hide_env_values = true,
+        help = "Hotkey that starts recording",
+        long_help = "Hotkey that starts recording.\n\nMust be paired with --stop-hotkey. Do not combine start/stop mode with --toggle-hotkey."
+    )]
     pub start_hotkey: Option<String>,
 
-    #[arg(long, env = "GROQ_STOP_HOTKEY")]
+    #[arg(
+        long,
+        env = "GROQ_STOP_HOTKEY",
+        hide_env_values = true,
+        help = "Hotkey that stops recording",
+        long_help = "Hotkey that stops recording.\n\nMust be paired with --start-hotkey. Do not combine start/stop mode with --toggle-hotkey."
+    )]
     pub stop_hotkey: Option<String>,
 
-    #[arg(long, env = "GROQ_FFMPEG_PATH")]
+    #[arg(
+        long,
+        env = "GROQ_FFMPEG_PATH",
+        hide_env_values = true,
+        help = "Path to ffmpeg",
+        long_help = "Path to ffmpeg.\n\nUsed by the ffmpeg MP3 backend and fixture/smoke workflows. Defaults to ffmpeg from PATH when omitted."
+    )]
     pub ffmpeg_path: Option<String>,
 
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Extra argument appended to the ffmpeg command",
+        long_help = "Extra argument appended to the ffmpeg command.\n\nMay be repeated. Arguments are appended after the built-in MP3 encoder arguments so explicit overrides are possible when debugging ffmpeg behavior."
+    )]
     pub ffmpeg_extra_arg: Vec<String>,
 
-    #[arg(long, env = "GROQ_TEMP_DIR")]
+    #[arg(
+        long,
+        env = "GROQ_TEMP_DIR",
+        hide_env_values = true,
+        help = "Directory for temporary audio files",
+        long_help = "Directory for temporary audio files.\n\nDefaults to the system temporary directory joined with groq-whisper-app."
+    )]
     pub temp_dir: Option<PathBuf>,
 
-    #[arg(long, default_value_t = 48, env = "GROQ_BITRATE_KBPS")]
+    #[arg(
+        long,
+        default_value_t = 48,
+        env = "GROQ_BITRATE_KBPS",
+        hide_env_values = true,
+        help = "MP3 bitrate in kbps",
+        long_help = "MP3 bitrate in kbps.\n\nUsed by both MP3 backends. The default is 48 kbps."
+    )]
     pub bitrate_kbps: u32,
 
-    #[arg(long, default_value_t = 16000, env = "GROQ_OUTPUT_SAMPLE_RATE")]
+    #[arg(
+        long,
+        default_value_t = 16000,
+        env = "GROQ_OUTPUT_SAMPLE_RATE",
+        hide_env_values = true,
+        help = "Encoded audio sample rate in Hz",
+        long_help = "Encoded audio sample rate in Hz.\n\nThe default is 16000 Hz, which is suitable for speech transcription."
+    )]
     pub output_sample_rate: u32,
 
-    #[arg(long, default_value_t = 1, env = "GROQ_OUTPUT_CHANNELS")]
+    #[arg(
+        long,
+        default_value_t = 1,
+        env = "GROQ_OUTPUT_CHANNELS",
+        hide_env_values = true,
+        help = "Encoded audio channel count",
+        long_help = "Encoded audio channel count.\n\nThe default is mono. The lame backend supports mono and stereo input paths."
+    )]
     pub output_channels: u16,
 
-    #[arg(long, default_value_t = 120, env = "GROQ_REQUEST_TIMEOUT_SECS")]
+    #[arg(
+        long,
+        default_value_t = 120,
+        env = "GROQ_REQUEST_TIMEOUT_SECS",
+        hide_env_values = true,
+        help = "HTTP request timeout in seconds",
+        long_help = "HTTP request timeout in seconds for Groq transcription requests."
+    )]
     pub request_timeout_secs: u64,
 
-    #[arg(long, default_value_t = 0.0, env = "GROQ_TEMPERATURE")]
+    #[arg(
+        long,
+        default_value_t = 0.0,
+        env = "GROQ_TEMPERATURE",
+        hide_env_values = true,
+        help = "Whisper sampling temperature",
+        long_help = "Whisper sampling temperature.\n\nThe default 0.0 favors deterministic transcription."
+    )]
     pub temperature: f32,
 
-    #[arg(long, default_value_t = false, env = "GROQ_SHOW_SETTINGS")]
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "GROQ_SHOW_SETTINGS",
+        hide_env_values = true,
+        help = "Open the settings panel on launch",
+        long_help = "Open the settings panel on launch.\n\nThis is also enabled when the persisted UI state says settings should be shown."
+    )]
     pub show_settings: bool,
 
-    #[arg(long, default_value_t = false, env = "GROQ_KEEP_AUDIO")]
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "GROQ_KEEP_AUDIO",
+        hide_env_values = true,
+        help = "Keep temporary audio files after transcription",
+        long_help = "Keep temporary audio files after transcription.\n\nUseful for debugging encoder output. By default, temporary capture files may be cleaned up after use."
+    )]
     pub keep_audio: bool,
 
-    #[arg(long, default_value_t = false, env = "GROQ_DISABLE_CLIPBOARD")]
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "GROQ_DISABLE_CLIPBOARD",
+        hide_env_values = true,
+        help = "Do not copy transcription text to the clipboard",
+        long_help = "Do not copy transcription text to the clipboard.\n\nUse this when clipboard integration fails or when you want to inspect text only inside the Debug UI."
+    )]
     pub disable_clipboard: bool,
 
-    #[arg(long, default_value_t = false, env = "GROQ_WORD_TIMESTAMPS")]
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "GROQ_WORD_TIMESTAMPS",
+        hide_env_values = true,
+        help = "Request word-level timestamps",
+        long_help = "Request word-level timestamps.\n\nThis forces --response-format verbose-json because timestamp data is not available in plain text responses."
+    )]
     pub word_timestamps: bool,
 
-    #[arg(long, default_value_t = false, env = "GROQ_SEGMENT_TIMESTAMPS")]
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "GROQ_SEGMENT_TIMESTAMPS",
+        hide_env_values = true,
+        help = "Request segment-level timestamps",
+        long_help = "Request segment-level timestamps.\n\nThis forces --response-format verbose-json because timestamp data is not available in plain text responses."
+    )]
     pub segment_timestamps: bool,
 }
 
@@ -285,7 +516,7 @@ impl AppConfig {
         let temp_dir = cli
             .temp_dir
             .clone()
-            .unwrap_or_else(|| std::env::temp_dir().join("groq-whisper-desktop"));
+            .unwrap_or_else(|| std::env::temp_dir().join("groq-whisper-app"));
 
         Ok(Self {
             api_key: cli.api_key.clone(),

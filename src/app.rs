@@ -4,6 +4,7 @@ use crate::audio::{
 use crate::config::{AppConfig, GpuOffloadMode, UiMode, WHISPER_MODEL_V3, WHISPER_MODEL_V3_TURBO};
 use crate::persistence::{self, LastResultRecord, StoredAppState};
 use crate::transcriber::{self, TranscriptionResult};
+use crate::usage::{self, SessionUsage};
 use anyhow::anyhow;
 use arboard::Clipboard;
 use crossbeam_channel::{unbounded, Receiver, Sender};
@@ -22,6 +23,9 @@ pub struct VoiceDeskApp {
     transcript_text: String,
     debug_lines: Vec<String>,
     show_settings: bool,
+    session_usage: SessionUsage,
+    show_exit_summary: bool,
+    exit_confirmed: bool,
     tx: Sender<AppMessage>,
     rx: Receiver<AppMessage>,
 }
@@ -48,6 +52,7 @@ enum AppMessage {
 struct CompletedJob {
     recording: CompletedRecording,
     transcript: TranscriptionResult,
+    model: String,
 }
 
 impl VoiceDeskApp {
@@ -72,6 +77,9 @@ impl VoiceDeskApp {
             transcript_text: String::new(),
             debug_lines: Vec::new(),
             show_settings: false,
+            session_usage: SessionUsage::default(),
+            show_exit_summary: false,
+            exit_confirmed: false,
             tx,
             rx,
         };
@@ -131,6 +139,8 @@ impl VoiceDeskApp {
     fn handle_completed_job(&mut self, job: CompletedJob) {
         let request_id = job.transcript.request_id.clone();
         let elapsed_ms = job.transcript.elapsed.as_millis();
+        let recording_duration = job.recording.duration;
+        let model = job.model.clone();
         self.transcript_text = job.transcript.text.clone();
 
         let copied_to_clipboard = if self.config.copy_to_clipboard {
@@ -166,11 +176,13 @@ impl VoiceDeskApp {
         self.persisted.last_result = Some(LastResultRecord::now(
             preview,
             char_count,
-            self.config.model.clone(),
+            model.clone(),
             request_id.clone(),
             copied_to_clipboard,
             audio_path,
         ));
+        self.session_usage
+            .record_transcription(&model, recording_duration);
 
         if let Err(error) = self.persist_preferences() {
             self.append_log(format!("設定保存失敗: {error}"));
@@ -186,6 +198,13 @@ impl VoiceDeskApp {
 
         self.status = UiStatus::Success(status_message.clone());
         self.append_log(status_message);
+        self.append_log(format!(
+            "今回の推定利用: {} request / 実音声 {} / 課金対象 {} / 推定 {}",
+            self.session_usage.total_requests(),
+            usage::format_seconds(self.session_usage.total_actual_seconds()),
+            usage::format_seconds(self.session_usage.total_billable_seconds()),
+            usage::format_usd(self.session_usage.estimated_total_cost_usd()),
+        ));
 
         if let Some(raw_response) = job.transcript.raw_response {
             self.append_log("Groq 応答 JSON をデバッグログに保持しました。".to_string());
@@ -318,11 +337,13 @@ impl VoiceDeskApp {
 
                 let api = transcriber_config
                     .ok_or_else(|| anyhow!("GROQ_API_KEY が設定されていません。"))?;
+                let model = api.model.clone();
 
                 let transcript = transcriber::transcribe_file(&api, &recording.encoded_audio)?;
                 Ok(Box::new(CompletedJob {
                     recording,
                     transcript,
+                    model,
                 }))
             })()
             .map_err(|error| error.to_string());
@@ -351,7 +372,7 @@ impl VoiceDeskApp {
             } = event
             {
                 if is_quit_key(key) {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    self.request_exit();
                     break;
                 }
 
@@ -375,6 +396,18 @@ impl VoiceDeskApp {
                     None => {}
                 }
             }
+        }
+    }
+
+    fn request_exit(&mut self) {
+        self.show_exit_summary = true;
+    }
+
+    fn handle_close_request(&mut self, ctx: &egui::Context) {
+        let close_requested = ctx.input(|input| input.viewport().close_requested());
+        if close_requested && !self.exit_confirmed {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.show_exit_summary = true;
         }
     }
 
@@ -605,10 +638,87 @@ impl VoiceDeskApp {
             }
         }
     }
+
+    fn draw_exit_summary_window(&mut self, ctx: &egui::Context) {
+        if !self.show_exit_summary {
+            return;
+        }
+
+        let mut open = true;
+        egui::Window::new("終了前の利用サマリ")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.add(egui::Label::new("この起動中に成功した Groq Whisper API 呼び出しの推定利用量です。Groq の音声文字起こしはトークンではなく音声時間ベースで課金されるため、料金は録音時間からの推定です。").wrap(true));
+                ui.add_space(6.0);
+
+                if self.session_usage.is_empty() {
+                    ui.label("今回の起動中に成功したAPI呼び出しはありません。");
+                } else {
+                    ui.label(format!(
+                        "APIリクエスト数: {}",
+                        self.session_usage.total_requests()
+                    ));
+                    ui.label(format!(
+                        "実録音時間: {}",
+                        usage::format_seconds(self.session_usage.total_actual_seconds())
+                    ));
+                    ui.label(format!(
+                        "課金対象時間: {}",
+                        usage::format_seconds(self.session_usage.total_billable_seconds())
+                    ));
+                    ui.label(format!(
+                        "推定合計: {}",
+                        usage::format_usd(self.session_usage.estimated_total_cost_usd())
+                    ));
+
+                    ui.separator();
+                    for (model, model_usage) in self.session_usage.model_usages() {
+                        let cost = model_usage
+                            .estimated_cost_usd(model)
+                            .map(usage::format_usd)
+                            .unwrap_or_else(|| "単価不明".to_string());
+                        ui.label(format!(
+                            "{}: {} request / 実音声 {} / 課金対象 {} / 推定 {}",
+                            whisper_model_label(model),
+                            model_usage.requests,
+                            usage::format_seconds(model_usage.actual_seconds),
+                            usage::format_seconds(model_usage.billable_seconds),
+                            cost
+                        ));
+                    }
+
+                    if self.session_usage.has_unknown_price() {
+                        ui.add(egui::Label::new("単価不明のモデルは推定合計に含めていません。").wrap(true));
+                    }
+                }
+
+                ui.add_space(6.0);
+                ui.add(egui::Label::new("実際の請求額はクレジット、割引、価格変更、失敗リクエストの扱いにより異なる可能性があります。最終確認は Groq Console の Usage / Billing で行ってください。").wrap(true));
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    if ui.button("アプリに戻る").clicked() {
+                        self.show_exit_summary = false;
+                    }
+
+                    if ui.button("終了").clicked() {
+                        self.exit_confirmed = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+            });
+
+        if !open {
+            self.show_exit_summary = false;
+        }
+    }
 }
 
 impl eframe::App for VoiceDeskApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_close_request(ctx);
         self.process_messages();
         self.handle_shortcuts(ctx);
 
@@ -625,6 +735,7 @@ impl eframe::App for VoiceDeskApp {
 
         self.draw_main_panel(ctx);
         self.draw_settings_window(ctx);
+        self.draw_exit_summary_window(ctx);
         ctx.request_repaint_after(Duration::from_millis(33));
     }
 }

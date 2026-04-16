@@ -47,7 +47,7 @@ fn install_system_cjk_font(ctx: &egui::Context) -> Option<PathBuf> {
         Ok(bytes) => bytes,
         Err(error) => {
             eprintln!(
-                "[groq-whisper-desktop] failed to read UI font {}: {error}",
+                "[groq-whisper-app] failed to read UI font {}: {error}",
                 font_path.display()
             );
             return None;
@@ -72,7 +72,7 @@ fn install_system_cjk_font(ctx: &egui::Context) -> Option<PathBuf> {
 
     ctx.set_fonts(fonts);
     eprintln!(
-        "[groq-whisper-desktop] loaded UI font {}",
+        "[groq-whisper-app] loaded UI font {}",
         font_path.display()
     );
     Some(font_path)

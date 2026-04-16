@@ -105,7 +105,7 @@ run *args:
 
 # ビルド済み release バイナリを通常 UI モードで起動。追加 CLI 引数は `just -- run-release --ui-mode debug` の形で渡す。
 run-release *args:
-    target/release/groq-whisper-desktop {{args}}
+    target/release/groq-whisper-app {{args}}
 
 # デバッグ UI モードで起動
 run-debug:

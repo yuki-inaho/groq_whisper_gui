@@ -1807,7 +1807,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "groq-whisper-desktop"
+name = "groq-whisper-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",

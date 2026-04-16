@@ -8,6 +8,7 @@ mod hotkey;
 mod persistence;
 mod transcriber;
 mod ui;
+mod usage;
 
 use anyhow::Result;
 use clap::Parser;
@@ -37,7 +38,7 @@ fn main() -> Result<()> {
 
     // 起動時に明示的な選択値をログへ出力する (暗黙 fallback 禁止 / 監査トレーサビリティ)。
     eprintln!(
-        "[groq-whisper-desktop] ui_mode={}, mp3_encoder={}, lame_path={}",
+        "[groq-whisper-app] ui_mode={}, mp3_encoder={}, lame_path={}",
         config.ui_mode.label(),
         config.mp3_encoder.label(),
         config.lame_path,
