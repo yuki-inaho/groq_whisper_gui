@@ -1,5 +1,9 @@
 # Groq Whisper GUI App
 
+<p align="center">
+  <img src="assets/groq-whisper-app-screenshot.png" alt="Groq Whisper App screenshot" width="720">
+</p>
+
 Groq Whisper API を利用する Rust 製の単独デスクトップ GUI アプリです。アプリをフォーカスした状態でショートカットキーにより録音を開始・停止し、録音中に音声を逐次 MP3 エンコードし、停止後に文字起こし API を呼び出して結果をクリップボードへ反映します。
 
 ## 主な機能

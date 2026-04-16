@@ -10,7 +10,7 @@
 /CLAUDE.md
 /CODEX.md
 
-# Local secrets. Keep `.env.example` tracked as documentation.
+# Local secrets. Keep `example.env` tracked as documentation.
 .env
 .env.local
 
