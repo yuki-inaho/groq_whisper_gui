@@ -165,19 +165,7 @@ impl VoiceDeskApp {
         self.transcript_text = job.transcript.text.clone();
 
         let copied_to_clipboard = if self.config.copy_to_clipboard {
-            match Clipboard::new() {
-                Ok(mut clipboard) => match clipboard.set_text(job.transcript.text.clone()) {
-                    Ok(_) => true,
-                    Err(error) => {
-                        self.append_log(format!("クリップボード更新失敗: {error}"));
-                        false
-                    }
-                },
-                Err(error) => {
-                    self.append_log(format!("クリップボード初期化失敗: {error}"));
-                    false
-                }
-            }
+            self.copy_text_to_clipboard(&job.transcript.text)
         } else {
             false
         };
@@ -230,6 +218,24 @@ impl VoiceDeskApp {
         if let Some(raw_response) = job.transcript.raw_response {
             self.append_log("Groq 応答 JSON をデバッグログに保持しました。".to_string());
             self.append_log(raw_response);
+        }
+    }
+
+    /// 与えられたテキストをクリップボードへ書き込む。成功可否を返し、失敗時は
+    /// 理由をデバッグログへ残す。自動コピー(転写完了時)と手動コピー(ボタン)で共用する。
+    fn copy_text_to_clipboard(&mut self, text: &str) -> bool {
+        match Clipboard::new() {
+            Ok(mut clipboard) => match clipboard.set_text(text.to_owned()) {
+                Ok(_) => true,
+                Err(error) => {
+                    self.append_log(format!("クリップボード更新失敗: {error}"));
+                    false
+                }
+            },
+            Err(error) => {
+                self.append_log(format!("クリップボード初期化失敗: {error}"));
+                false
+            }
         }
     }
 
@@ -544,6 +550,25 @@ impl VoiceDeskApp {
 
                 if ui.button("設定").clicked() {
                     self.show_settings = true;
+                }
+
+                if ui
+                    .add_enabled(
+                        !self.transcript_text.is_empty(),
+                        egui::Button::new("クリップボードへコピー"),
+                    )
+                    .on_hover_text("直前の文字起こし結果をクリップボードへコピーします。")
+                    .clicked()
+                {
+                    let text = self.transcript_text.clone();
+                    if self.copy_text_to_clipboard(&text) {
+                        self.status = UiStatus::Success(
+                            "直前の文字起こしをクリップボードへコピーしました。".to_string(),
+                        );
+                        self.append_log(
+                            "直前の文字起こしをクリップボードへコピーしました。".to_string(),
+                        );
+                    }
                 }
             });
 
