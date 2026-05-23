@@ -10,6 +10,9 @@
 /CLAUDE.md
 /CODEX.md
 
+# Serena MCP local cache / memories / project config
+/.serena/
+
 # Local secrets. Keep `example.env` tracked as documentation.
 .env
 .env.local
