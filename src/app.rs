@@ -2,6 +2,7 @@ use crate::audio::{
     self, AudioCaptureRequest, CompletedRecording, InputDeviceInfo, RecordingSession,
 };
 use crate::config::{AppConfig, GpuOffloadMode, UiMode, WHISPER_MODEL_V3, WHISPER_MODEL_V3_TURBO};
+use crate::hotkey_listener::RawHotkey;
 use crate::persistence::{self, LastResultRecord, StoredAppState};
 use crate::transcriber::{self, TranscriptionResult};
 use crate::usage::{self, SessionUsage};
@@ -26,6 +27,7 @@ pub struct VoiceDeskApp {
     session_usage: SessionUsage,
     show_exit_summary: bool,
     exit_confirmed: bool,
+    hotkey_rx: Option<Receiver<RawHotkey>>,
     tx: Sender<AppMessage>,
     rx: Receiver<AppMessage>,
 }
@@ -80,6 +82,7 @@ impl VoiceDeskApp {
             session_usage: SessionUsage::default(),
             show_exit_summary: false,
             exit_confirmed: false,
+            hotkey_rx: None,
             tx,
             rx,
         };
@@ -113,6 +116,24 @@ impl VoiceDeskApp {
 
         if let Some(last_result) = &app.persisted.last_result {
             app.append_log(format!("前回転写: {}", last_result.occurred_at_local));
+        }
+
+        // IME 非依存ショートカット: evdev でキーボードを直接読めるなら有効化する。
+        // 読めない場合 (権限不足等) は明示的にログを残し、egui イベント経路へ切り替える
+        // (暗黙 fallback 禁止)。
+        match crate::hotkey_listener::spawn_keyboard_listener() {
+            Ok(listener) => {
+                app.append_log(format!(
+                    "IME 非依存ショートカット(evdev)を有効化。監視デバイス: {}",
+                    listener.device_names.join(", ")
+                ));
+                app.hotkey_rx = Some(listener.receiver);
+            }
+            Err(error) => {
+                app.append_log(format!(
+                    "evdev を有効化できませんでした（{error}）。半角入力時のみ通常ショートカットが効きます。"
+                ));
+            }
         }
 
         app
@@ -360,6 +381,37 @@ impl VoiceDeskApp {
         }
     }
 
+    fn process_hotkeys(&mut self, ctx: &egui::Context) {
+        // evdev が有効なときはそれを唯一のショートカット源とし、egui イベント経路は
+        // 使わない (半角モードで二重発火しないようにするため)。evdev が無効なときだけ
+        // egui イベント経路へ明示的に切り替える (暗黙 fallback 禁止)。
+        if self.hotkey_rx.is_some() {
+            self.process_global_hotkeys(ctx);
+        } else {
+            self.handle_shortcuts(ctx);
+        }
+    }
+
+    /// evdev 経路。自ウィンドウにフォーカスがある時のみ発火させ、グローバル誤爆を防ぐ。
+    /// フォーカス有無に関わらずキューは drain し、非フォーカス時の押下は破棄する。
+    fn process_global_hotkeys(&mut self, ctx: &egui::Context) {
+        let pending: Vec<RawHotkey> = match &self.hotkey_rx {
+            Some(rx) => rx.try_iter().collect(),
+            None => return,
+        };
+
+        if !ctx.input(|input| input.focused) {
+            return;
+        }
+
+        for hotkey in pending {
+            if self.dispatch_shortcut(ctx, hotkey.key, hotkey.modifiers) {
+                break;
+            }
+        }
+    }
+
+    /// egui イベント経路 (evdev が使えない環境向けの明示的 fallback)。
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let events = ctx.input(|input| input.events.clone());
         for event in events {
@@ -371,31 +423,44 @@ impl VoiceDeskApp {
                 ..
             } = event
             {
-                if is_quit_key(key) {
-                    self.request_exit(ctx);
+                if self.dispatch_shortcut(ctx, key, modifiers) {
                     break;
                 }
-
-                match self.config.hotkeys.trigger(key, modifiers) {
-                    Some(crate::hotkey::HotkeyAction::Toggle) => {
-                        self.toggle_recording();
-                        break;
-                    }
-                    Some(crate::hotkey::HotkeyAction::Start) => {
-                        if self.recorder.is_none() {
-                            self.start_recording();
-                        }
-                        break;
-                    }
-                    Some(crate::hotkey::HotkeyAction::Stop) => {
-                        if self.recorder.is_some() {
-                            self.stop_recording();
-                        }
-                        break;
-                    }
-                    None => {}
-                }
             }
+        }
+    }
+
+    /// 論理キー + 修飾キーをショートカット動作へ振り分ける。egui 経路と evdev 経路で
+    /// 共通利用する (DRY)。同フレームの後続キーを見ない場合に true を返す。
+    fn dispatch_shortcut(
+        &mut self,
+        ctx: &egui::Context,
+        key: egui::Key,
+        modifiers: egui::Modifiers,
+    ) -> bool {
+        if is_quit_key(key) {
+            self.request_exit(ctx);
+            return true;
+        }
+
+        match self.config.hotkeys.trigger(key, modifiers) {
+            Some(crate::hotkey::HotkeyAction::Toggle) => {
+                self.toggle_recording();
+                true
+            }
+            Some(crate::hotkey::HotkeyAction::Start) => {
+                if self.recorder.is_none() {
+                    self.start_recording();
+                }
+                true
+            }
+            Some(crate::hotkey::HotkeyAction::Stop) => {
+                if self.recorder.is_some() {
+                    self.stop_recording();
+                }
+                true
+            }
+            None => false,
         }
     }
 
@@ -736,7 +801,7 @@ impl eframe::App for VoiceDeskApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_close_request(ctx);
         self.process_messages();
-        self.handle_shortcuts(ctx);
+        self.process_hotkeys(ctx);
 
         let raw_level = self
             .recorder

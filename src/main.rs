@@ -5,6 +5,7 @@ mod encoder;
 #[cfg(test)]
 mod fixture;
 mod hotkey;
+mod hotkey_listener;
 mod persistence;
 mod transcriber;
 mod ui;
