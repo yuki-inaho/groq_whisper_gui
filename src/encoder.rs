@@ -18,6 +18,7 @@ pub struct EncoderSettings {
     pub bitrate_kbps: u32,
     pub output_sample_rate: u32,
     pub output_channels: u16,
+    pub keep_audio: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -59,29 +60,76 @@ pub fn create_encoder(
         )
     })?;
 
-    match settings.format {
-        EncoderFormat::Mp3 => {
-            let output_path = next_output_path(&settings.temp_dir, settings.format.extension());
-            match settings.mp3_encoder {
-                Mp3EncoderBackend::Ffmpeg => Ok(Box::new(FfmpegMp3Encoder::new(
-                    settings,
-                    input_spec,
-                    output_path,
-                )?)),
-                Mp3EncoderBackend::Lame => Ok(Box::new(LameMp3Encoder::new(
-                    settings,
-                    input_spec,
-                    output_path,
-                )?)),
-            }
-        }
-        EncoderFormat::Wav => {
-            let output_path = next_output_path(&settings.temp_dir, settings.format.extension());
-            Ok(Box::new(WavEncoder::new(
+    let output_path = next_output_path(&settings.temp_dir, settings.format.extension());
+    let inner: Box<dyn StreamingEncoder> = match settings.format {
+        EncoderFormat::Mp3 => match settings.mp3_encoder {
+            Mp3EncoderBackend::Ffmpeg => Box::new(FfmpegMp3Encoder::new(
                 settings,
                 input_spec,
-                output_path,
-            )?))
+                output_path.clone(),
+            )?),
+            Mp3EncoderBackend::Lame => Box::new(LameMp3Encoder::new(
+                settings,
+                input_spec,
+                output_path.clone(),
+            )?),
+        },
+        EncoderFormat::Wav => Box::new(WavEncoder::new(settings, input_spec, output_path.clone())?),
+    };
+
+    Ok(Box::new(CleanupOnFailureEncoder {
+        inner: Some(inner),
+        output_path,
+        keep_audio: settings.keep_audio,
+        completed: false,
+    }))
+}
+
+/// `write_samples` / `finish` の失敗時に、バックエンドが書きかけの出力を
+/// 残さないための共通ラッパー。`keep_audio=false` の場合だけ削除する。
+///
+/// 各バックエンドへ同じ Drop 実装を複製せず、1 箇所で所有権を管理する。
+/// `finish` 成功時だけ `completed` を立てるため、途中エラーや早期 return でも
+/// Drop が cleanup を実行する。
+struct CleanupOnFailureEncoder {
+    inner: Option<Box<dyn StreamingEncoder>>,
+    output_path: PathBuf,
+    keep_audio: bool,
+    completed: bool,
+}
+
+impl StreamingEncoder for CleanupOnFailureEncoder {
+    fn write_samples(&mut self, samples: &[i16]) -> Result<()> {
+        self.inner
+            .as_mut()
+            .context("encoder is already consumed")?
+            .write_samples(samples)
+    }
+
+    fn finish(mut self: Box<Self>) -> Result<EncodedAudio> {
+        let inner = self.inner.take().context("encoder is already consumed")?;
+        let audio = inner.finish()?;
+        self.completed = true;
+        Ok(audio)
+    }
+}
+
+impl Drop for CleanupOnFailureEncoder {
+    fn drop(&mut self) {
+        // ファイルハンドルや子プロセスを先に解放してから削除する。
+        drop(self.inner.take());
+
+        if self.completed || self.keep_audio {
+            return;
+        }
+
+        if let Err(error) = fs::remove_file(&self.output_path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "failed to remove partial audio {}: {error}",
+                    self.output_path.display()
+                );
+            }
         }
     }
 }
@@ -422,6 +470,10 @@ mod tests {
         std::env::var("GROQ_FFPROBE_PATH").unwrap_or_else(|_| "ffprobe".to_string())
     }
 
+    fn lame_bin() -> String {
+        std::env::var("GROQ_LAME_PATH").unwrap_or_else(|_| "lame".to_string())
+    }
+
     #[test]
     fn creates_unique_mp3_path_in_temp_dir() {
         let dir = std::env::temp_dir().join("groq-whisper-tests");
@@ -436,6 +488,124 @@ mod tests {
         assert_eq!(lame_sample_rate_arg(22_050), "22.05");
         assert_eq!(lame_sample_rate_arg(11_025), "11.025");
         assert_eq!(lame_sample_rate_arg(48_000), "48");
+    }
+
+    fn assert_valid_mp3(path: &Path) {
+        let probe = Command::new(ffprobe_bin())
+            .arg("-v")
+            .arg("error")
+            .arg("-of")
+            .arg("json")
+            .arg("-show_entries")
+            .arg("stream=codec_name,sample_rate,channels,bit_rate")
+            .arg(path)
+            .output()
+            .expect("ffprobe must be executable");
+        assert!(
+            probe.status.success(),
+            "ffprobe failed: {}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        let stdout = String::from_utf8(probe.stdout).expect("ffprobe stdout utf-8");
+        assert!(
+            stdout.contains("\"codec_name\": \"mp3\""),
+            "expected codec_name=mp3, got: {stdout}"
+        );
+        assert!(
+            stdout.contains("\"sample_rate\": \"16000\""),
+            "expected sample_rate=16000, got: {stdout}"
+        );
+        assert!(
+            stdout.contains("\"channels\": 1"),
+            "expected channels=1, got: {stdout}"
+        );
+        let has_bitrate =
+            (46_000..=52_000).any(|target| stdout.contains(&format!("\"bit_rate\": \"{target}\"")));
+        assert!(has_bitrate, "expected bit_rate near 48000, got: {stdout}");
+    }
+
+    struct FailingEncoder {
+        fail_on_write: bool,
+    }
+
+    impl StreamingEncoder for FailingEncoder {
+        fn write_samples(&mut self, _samples: &[i16]) -> Result<()> {
+            if self.fail_on_write {
+                return Err(anyhow::anyhow!("mock write failure"));
+            }
+            Ok(())
+        }
+
+        fn finish(self: Box<Self>) -> Result<EncodedAudio> {
+            Err(anyhow::anyhow!("mock finish failure"))
+        }
+    }
+
+    fn managed_failing_encoder(
+        path: &Path,
+        keep_audio: bool,
+        fail_on_write: bool,
+    ) -> Box<dyn StreamingEncoder> {
+        fs::write(path, b"partial audio").expect("write partial output");
+        Box::new(CleanupOnFailureEncoder {
+            inner: Some(Box::new(FailingEncoder { fail_on_write })),
+            output_path: path.to_path_buf(),
+            keep_audio,
+            completed: false,
+        })
+    }
+
+    #[test]
+    fn finish_failure_removes_partial_output_when_not_kept() {
+        let path = std::env::temp_dir().join(format!(
+            "groq-whisper-partial-finish-{}-{}.mp3",
+            std::process::id(),
+            chrono::Local::now()
+                .timestamp_nanos_opt()
+                .unwrap_or_default()
+        ));
+        let encoder = managed_failing_encoder(&path, false, false);
+
+        let error = encoder.finish().expect_err("finish failure must propagate");
+
+        assert!(error.to_string().contains("mock finish failure"));
+        assert!(!path.exists(), "partial output must be removed");
+    }
+
+    #[test]
+    fn write_failure_removes_partial_output_when_not_kept() {
+        let path = std::env::temp_dir().join(format!(
+            "groq-whisper-partial-write-{}-{}.mp3",
+            std::process::id(),
+            chrono::Local::now()
+                .timestamp_nanos_opt()
+                .unwrap_or_default()
+        ));
+        let mut encoder = managed_failing_encoder(&path, false, true);
+
+        assert!(encoder.write_samples(&[0_i16; 16]).is_err());
+        drop(encoder);
+
+        assert!(!path.exists(), "partial output must be removed");
+    }
+
+    #[test]
+    fn failure_keeps_partial_output_when_requested() {
+        let path = std::env::temp_dir().join(format!(
+            "groq-whisper-partial-keep-{}-{}.mp3",
+            std::process::id(),
+            chrono::Local::now()
+                .timestamp_nanos_opt()
+                .unwrap_or_default()
+        ));
+        let encoder = managed_failing_encoder(&path, true, false);
+
+        assert!(encoder.finish().is_err());
+        assert!(
+            path.exists(),
+            "keep_audio=true must retain the partial output"
+        );
+        let _ = fs::remove_file(path);
     }
 
     /// 16 kHz / mono / 48 kbps MP3 を生成する想定の raw PCM を、
@@ -461,12 +631,13 @@ mod tests {
             mp3_encoder: Mp3EncoderBackend::Lame,
             ffmpeg_path: "ffmpeg".to_string(),
             ffmpeg_extra_args: Vec::new(),
-            lame_path: "/usr/bin/lame".to_string(),
+            lame_path: lame_bin(),
             gpu_offload: GpuOffloadMode::Off,
             temp_dir: temp_dir.clone(),
             bitrate_kbps: 48,
             output_sample_rate: 16_000,
             output_channels: 1,
+            keep_audio: false,
         };
 
         // 48 kHz mono を 1 秒分、440 Hz サイン波で生成する (2^15 - 1 の 25% 振幅)。
@@ -502,40 +673,7 @@ mod tests {
         assert!(encoded.byte_len > 0, "encoded mp3 must be non-empty");
         assert_eq!(encoded.format, EncoderFormat::Mp3);
         assert!(output_path.exists(), "output file must exist");
-
-        // ffprobe で MP3 メタデータを検証
-        let probe = Command::new(ffprobe_bin())
-            .arg("-v")
-            .arg("error")
-            .arg("-of")
-            .arg("json")
-            .arg("-show_entries")
-            .arg("stream=codec_name,sample_rate,channels,bit_rate")
-            .arg(&output_path)
-            .output()
-            .expect("ffprobe must be executable");
-        assert!(
-            probe.status.success(),
-            "ffprobe failed: {}",
-            String::from_utf8_lossy(&probe.stderr)
-        );
-        let stdout = String::from_utf8(probe.stdout).expect("ffprobe stdout utf-8");
-        assert!(
-            stdout.contains("\"codec_name\": \"mp3\""),
-            "expected codec_name=mp3, got: {stdout}"
-        );
-        assert!(
-            stdout.contains("\"sample_rate\": \"16000\""),
-            "expected sample_rate=16000, got: {stdout}"
-        );
-        assert!(
-            stdout.contains("\"channels\": 1"),
-            "expected channels=1, got: {stdout}"
-        );
-        // lame は平均 bit_rate を返す。48 kbps 近傍 (46000..=52000) を許容。
-        let has_bitrate =
-            (46_000..=52_000).any(|target| stdout.contains(&format!("\"bit_rate\": \"{target}\"")));
-        assert!(has_bitrate, "expected bit_rate near 48000, got: {stdout}");
+        assert_valid_mp3(&output_path);
     }
 
     /// libmp3lame の有無に依存せず、ffmpeg バックエンドの契約を検証する。
@@ -562,12 +700,13 @@ mod tests {
             mp3_encoder: Mp3EncoderBackend::Ffmpeg,
             ffmpeg_path: ffmpeg_bin(),
             ffmpeg_extra_args: Vec::new(),
-            lame_path: "/usr/bin/lame".to_string(),
+            lame_path: lame_bin(),
             gpu_offload: GpuOffloadMode::Off,
             temp_dir,
             bitrate_kbps: 48,
             output_sample_rate: 16_000,
             output_channels: 1,
+            keep_audio: false,
         };
 
         let input_spec = AudioInputSpec {
@@ -591,6 +730,7 @@ mod tests {
                     "ffmpeg success must produce a non-empty MP3"
                 );
                 assert!(output_path.exists(), "ffmpeg output file must exist");
+                assert_valid_mp3(&output_path);
             }
             Err(err) => {
                 let message = format!("{err:#}");
@@ -619,12 +759,15 @@ mod tests {
     #[test]
     #[ignore]
     fn ffmpeg_backend_does_not_implicitly_fallback() {
-        let temp_dir = std::env::temp_dir().join("groq-whisper-tests-ffmpeg");
+        let temp_dir = std::env::temp_dir().join(format!(
+            "groq-whisper-tests-ffmpeg-{}-{}",
+            std::process::id(),
+            chrono::Local::now()
+                .timestamp_nanos_opt()
+                .unwrap_or_default()
+        ));
+        let _ = fs::remove_dir_all(&temp_dir);
         fs::create_dir_all(&temp_dir).expect("create temp dir");
-        let output_path = temp_dir.join("ffmpeg_backend_does_not_implicitly_fallback.mp3");
-        if output_path.exists() {
-            fs::remove_file(&output_path).expect("clean previous output");
-        }
 
         let settings = EncoderSettings {
             format: EncoderFormat::Mp3,
@@ -632,12 +775,13 @@ mod tests {
             ffmpeg_path: ffmpeg_bin(),
             // 最後の -codec:a で上書きして Unknown encoder を誘発する
             ffmpeg_extra_args: vec!["-codec:a".to_string(), "nonexistent_codec".to_string()],
-            lame_path: "/usr/bin/lame".to_string(),
+            lame_path: lame_bin(),
             gpu_offload: GpuOffloadMode::Off,
-            temp_dir,
+            temp_dir: temp_dir.clone(),
             bitrate_kbps: 48,
             output_sample_rate: 16_000,
             output_channels: 1,
+            keep_audio: false,
         };
 
         let input_spec = AudioInputSpec {
@@ -645,10 +789,9 @@ mod tests {
             channels: 1,
         };
 
-        let mut encoder: Box<dyn StreamingEncoder> = Box::new(
-            FfmpegMp3Encoder::new(&settings, input_spec, output_path.clone())
-                .expect("spawn ffmpeg. Ensure ffmpeg is in PATH or set GROQ_FFMPEG_PATH."),
-        );
+        // 本番と同じ create_encoder 経路を使い、失敗時 cleanup wrapper も検証する。
+        let mut encoder = create_encoder(&settings, input_spec)
+            .expect("spawn ffmpeg. Ensure ffmpeg is in PATH or set GROQ_FFMPEG_PATH.");
 
         // 短い無音バッファを書き込む (1 チャンクで十分)
         let silent: Vec<i16> = vec![0; 48_000];
@@ -665,13 +808,18 @@ mod tests {
             message.contains("nonexistent_codec") || message.contains("Unknown encoder"),
             "expected ffmpeg failure to mention the bad codec, got: {message}"
         );
-        // 出力ファイルは作られない (または空)
+
+        // keep_audio=false の失敗では部分出力も含めて残さない。
+        let leftovers: Vec<_> = fs::read_dir(&temp_dir)
+            .expect("read temp dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect();
         assert!(
-            !output_path.exists()
-                || fs::metadata(&output_path)
-                    .map(|m| m.len() == 0)
-                    .unwrap_or(true),
-            "ffmpeg failure must not leave a populated mp3"
+            leftovers.is_empty(),
+            "ffmpeg failure must remove partial output: {leftovers:?}"
         );
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }

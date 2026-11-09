@@ -412,7 +412,7 @@ pub struct CliArgs {
         env = "GROQ_KEEP_AUDIO",
         hide_env_values = true,
         help = "Keep temporary audio files after transcription",
-        long_help = "Keep temporary audio files after transcription.\n\nUseful for debugging encoder output. By default, temporary capture files may be cleaned up after use."
+        long_help = "Keep temporary audio files after transcription.\n\nBy default, the app removes temporary capture files after success or failure. Set this flag to keep them for encoder and API diagnostics."
     )]
     pub keep_audio: bool,
 
@@ -573,6 +573,7 @@ impl AppConfig {
             bitrate_kbps: self.bitrate_kbps,
             output_sample_rate: self.output_sample_rate,
             output_channels: self.output_channels,
+            keep_audio: self.keep_audio,
         }
     }
 
