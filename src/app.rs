@@ -23,6 +23,7 @@ pub struct VoiceDeskApp {
     selected_device: Option<String>,
     recorder: Option<RecordingSession>,
     smoothed_level: f32,
+    result_index: Option<u64>,
     status: UiStatus,
     transcript_text: String,
     debug_lines: Vec<String>,
@@ -89,6 +90,7 @@ impl VoiceDeskApp {
             selected_device,
             recorder: None,
             smoothed_level: 0.0,
+            result_index: None,
             status: UiStatus::Idle,
             transcript_text: String::new(),
             debug_lines: Vec::new(),
@@ -180,6 +182,7 @@ impl VoiceDeskApp {
         let recording_duration = job.recording.duration;
         let model = job.model.clone();
         self.transcript_text = job.transcript.text.clone();
+        self.result_index = Some(advance_result_index(self.result_index));
 
         let copied_to_clipboard = if self.config.copy_to_clipboard {
             self.copy_text_to_clipboard(&job.transcript.text)
@@ -587,7 +590,7 @@ impl VoiceDeskApp {
             });
 
             ui.separator();
-            draw_status_indicator(ui, self.smoothed_level, &status_text);
+            draw_status_indicator(ui, self.smoothed_level, self.result_index, &status_text);
             ui.label(format!("マイク: {selected_device}"));
 
             if let Some(last_result) = &self.persisted.last_result {
@@ -1010,14 +1013,72 @@ fn compact_status_message(message: &str) -> String {
     shortened
 }
 
-fn draw_status_indicator(ui: &mut egui::Ui, level: f32, status_text: &str) {
+fn advance_result_index(current: Option<u64>) -> u64 {
+    current.map_or(0, |index| index.saturating_add(1))
+}
+
+const RESULT_INDICATOR_COLORS: [egui::Color32; 6] = [
+    egui::Color32::from_rgb(65, 145, 230),
+    egui::Color32::from_rgb(56, 160, 105),
+    egui::Color32::from_rgb(232, 150, 50),
+    egui::Color32::from_rgb(150, 100, 215),
+    egui::Color32::from_rgb(40, 165, 170),
+    egui::Color32::from_rgb(215, 100, 150),
+];
+
+fn result_indicator_color(result_index: Option<u64>) -> egui::Color32 {
+    match result_index {
+        Some(index) => {
+            let palette_index = (index % RESULT_INDICATOR_COLORS.len() as u64) as usize;
+            RESULT_INDICATOR_COLORS[palette_index]
+        }
+        None => egui::Color32::from_rgb(180, 188, 192),
+    }
+}
+
+fn result_indicator_label(result_index: Option<u64>) -> String {
+    match result_index {
+        Some(index) => format!("#{index}"),
+        None => "#--".to_string(),
+    }
+}
+
+fn result_indicator_tooltip(result_index: Option<u64>) -> String {
+    match result_index {
+        Some(index) => format!("転写結果 #{index}。結果が増えると色と番号が変わります。"),
+        None => "転写結果はまだありません。結果ごとに色と番号が変わります。".to_string(),
+    }
+}
+
+fn draw_status_indicator(
+    ui: &mut egui::Ui,
+    level: f32,
+    result_index: Option<u64>,
+    status_text: &str,
+) {
     ui.horizontal(|ui| {
         let size = egui::vec2(18.0, 18.0);
-        let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+
+        let (level_rect, level_response) = ui.allocate_exact_size(size, egui::Sense::hover());
         ui.painter()
-            .circle_filled(rect.center(), 7.0, level_color(level));
+            .circle_filled(level_rect.center(), 7.0, level_color(level));
+        let _ = level_response
+            .on_hover_text(format!("録音レベル: {:.0}%", level.clamp(0.0, 1.0) * 100.0));
+
         ui.label(":");
         ui.add(egui::Label::new(egui::RichText::new(status_text).strong()).wrap(true));
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let (result_rect, result_response) = ui.allocate_exact_size(size, egui::Sense::hover());
+            ui.painter().circle_filled(
+                result_rect.center(),
+                7.0,
+                result_indicator_color(result_index),
+            );
+            let _ = result_response.on_hover_text(result_indicator_tooltip(result_index));
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new(result_indicator_label(result_index)).strong());
+        });
     });
 }
 
@@ -1281,6 +1342,49 @@ mod tests {
             .expect("successful job must be reported");
         assert_eq!(completed.transcript.text, "テスト");
         assert_eq!(completed.transcript.request_id.as_deref(), Some("req_test"));
+    }
+
+    #[test]
+    fn result_index_starts_at_zero_and_increments_per_successful_result() {
+        let first = advance_result_index(None);
+        let second = advance_result_index(Some(first));
+        let third = advance_result_index(Some(second));
+
+        assert_eq!(first, 0);
+        assert_eq!(second, 1);
+        assert_eq!(third, 2);
+        assert_eq!(result_indicator_label(Some(first)), "#0");
+        assert_eq!(result_indicator_label(Some(second)), "#1");
+    }
+
+    #[test]
+    fn result_color_cycles_after_palette_length_while_label_keeps_increasing() {
+        let palette_len = RESULT_INDICATOR_COLORS.len() as u64;
+
+        assert_eq!(
+            result_indicator_color(None),
+            egui::Color32::from_rgb(180, 188, 192)
+        );
+        assert_eq!(result_indicator_color(Some(0)), RESULT_INDICATOR_COLORS[0]);
+        assert_eq!(
+            result_indicator_color(Some(palette_len - 1)),
+            RESULT_INDICATOR_COLORS[RESULT_INDICATOR_COLORS.len() - 1]
+        );
+        assert_eq!(
+            result_indicator_color(Some(palette_len)),
+            RESULT_INDICATOR_COLORS[0]
+        );
+        assert_eq!(
+            result_indicator_label(Some(palette_len)),
+            format!("#{palette_len}")
+        );
+    }
+
+    #[test]
+    fn result_indicator_has_a_placeholder_before_the_first_result() {
+        assert_eq!(result_indicator_label(None), "#--");
+        assert!(result_indicator_tooltip(None).contains("まだありません"));
+        assert!(result_indicator_tooltip(Some(3)).contains("#3"));
     }
 
     #[test]
