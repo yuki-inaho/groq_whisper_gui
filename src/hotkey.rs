@@ -24,15 +24,15 @@ impl HotkeySet {
         start: Option<&str>,
         stop: Option<&str>,
     ) -> Result<Self> {
-        let toggle = match toggle {
+        let toggle: Option<HotkeyBinding> = match toggle {
             Some(value) if !value.trim().is_empty() => Some(value.parse()?),
             _ => None,
         };
-        let start = match start {
+        let start: Option<HotkeyBinding> = match start {
             Some(value) if !value.trim().is_empty() => Some(value.parse()?),
             _ => None,
         };
-        let stop = match stop {
+        let stop: Option<HotkeyBinding> = match stop {
             Some(value) if !value.trim().is_empty() => Some(value.parse()?),
             _ => None,
         };
@@ -43,6 +43,24 @@ impl HotkeySet {
 
         if start.is_some() ^ stop.is_some() {
             bail!("start_hotkey and stop_hotkey must be provided together");
+        }
+
+        // Q / Escape はアプリ終了として常に優先される。ここで拒否しないと、
+        // 設定は受理されるが実行時には終了キーとして消費され、ユーザーから見て
+        // ホットキーが無反応になる (設定と実行の不整合)。
+        for (name, binding) in [
+            ("toggle", toggle.as_ref()),
+            ("start", start.as_ref()),
+            ("stop", stop.as_ref()),
+        ] {
+            if let Some(binding) = binding {
+                if matches!(binding.key, KeyCode::Q | KeyCode::Escape) {
+                    bail!(
+                        "{name} hotkey {} is reserved for application quit; choose another key",
+                        binding
+                    );
+                }
+            }
         }
 
         if toggle.is_none() && start.is_none() && stop.is_none() {
@@ -395,5 +413,18 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("cannot be mixed"));
+    }
+
+    #[test]
+    fn rejects_quit_keys_as_recording_hotkeys() {
+        let toggle_error = HotkeySet::from_strings(Some("Q"), None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(toggle_error.contains("reserved for application quit"));
+
+        let stop_error = HotkeySet::from_strings(None, Some("Ctrl+S"), Some("Escape"))
+            .unwrap_err()
+            .to_string();
+        assert!(stop_error.contains("reserved for application quit"));
     }
 }

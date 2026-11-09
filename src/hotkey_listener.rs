@@ -169,8 +169,9 @@ fn is_keyboard(device: &Device) -> bool {
 /// `/dev/input` を走査してキーボードを開き、デバイス毎に blocking 読み取りスレッドを
 /// 起動する。1 台も開けない場合 (権限不足 / デバイス無し) は `Err` を返す。
 pub fn spawn_keyboard_listener() -> Result<KeyboardListener> {
-    let keyboards: Vec<(std::path::PathBuf, Device)> =
-        evdev::enumerate().filter(|(_, device)| is_keyboard(device)).collect();
+    let keyboards: Vec<(std::path::PathBuf, Device)> = evdev::enumerate()
+        .filter(|(_, device)| is_keyboard(device))
+        .collect();
 
     if keyboards.is_empty() {
         bail!(
@@ -194,7 +195,9 @@ pub fn spawn_keyboard_listener() -> Result<KeyboardListener> {
         thread::Builder::new()
             .name(thread_name)
             .spawn(move || run_device_loop(device, tx))
-            .with_context(|| format!("failed to spawn evdev reader thread for {}", path.display()))?;
+            .with_context(|| {
+                format!("failed to spawn evdev reader thread for {}", path.display())
+            })?;
     }
 
     Ok(KeyboardListener {
@@ -232,7 +235,9 @@ mod tests {
     #[test]
     fn space_press_emits_space_without_modifiers() {
         let mut resolver = HotkeyResolver::default();
-        let hotkey = resolver.on_key_event(KeyCode::KEY_SPACE, 1).expect("space press");
+        let hotkey = resolver
+            .on_key_event(KeyCode::KEY_SPACE, 1)
+            .expect("space press");
         assert_eq!(hotkey.key, Key::Space);
         assert_eq!(hotkey.modifiers, egui::Modifiers::default());
     }
@@ -247,7 +252,9 @@ mod tests {
     #[test]
     fn escape_maps_to_escape() {
         let mut resolver = HotkeyResolver::default();
-        let hotkey = resolver.on_key_event(KeyCode::KEY_ESC, 1).expect("esc press");
+        let hotkey = resolver
+            .on_key_event(KeyCode::KEY_ESC, 1)
+            .expect("esc press");
         assert_eq!(hotkey.key, Key::Escape);
     }
 

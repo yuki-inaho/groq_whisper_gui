@@ -27,6 +27,12 @@ cd "${REPO_ROOT}"
 INPUT="${1:-data/test_rec.mp3}"
 OUTPUT="${2:-target/smoke/streamed-lame-16k.mp3}"
 
+# 既定 fixture が無い場合だけ自動生成する。明示指定された入力を勝手に
+# 作らないことで、誤ったパス指定を成功扱いにしない (暗黙 fallback 禁止)。
+if [[ ! -f "${INPUT}" && "${INPUT}" == "data/test_rec.mp3" ]]; then
+    bash "${REPO_ROOT}/scripts/create-fixture.sh" "${INPUT}"
+fi
+
 if [[ ! -f "${INPUT}" ]]; then
     printf 'error: input audio not found: %s\n' "${INPUT}" >&2
     exit 1

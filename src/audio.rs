@@ -66,6 +66,10 @@ impl RecordingSession {
     }
 
     pub fn stop(mut self) -> Result<CompletedRecording> {
+        // 課金対象・表示に使う録音時間は、エンコーダの終了待ちを含めない。
+        // join() の後に測ると ffmpeg / lame の finalize 時間が混入する。
+        let captured_duration = self.started_at.elapsed();
+
         if let Some(stream) = self.stream.take() {
             drop(stream);
         }
@@ -86,7 +90,7 @@ impl RecordingSession {
             input_sample_rate: self.input_sample_rate,
             input_channels: self.input_channels,
             captured_samples: self.captured_samples.load(Ordering::Relaxed),
-            duration: self.started_at.elapsed(),
+            duration: captured_duration,
             encoded_audio,
         })
     }
@@ -264,4 +268,50 @@ where
     )?;
 
     Ok(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::EncoderFormat;
+
+    #[test]
+    fn stop_measures_capture_duration_before_encoder_finalize() {
+        let worker = thread::spawn(|| {
+            thread::sleep(Duration::from_millis(200));
+            Ok(EncodedAudio {
+                path: std::env::temp_dir().join("groq-whisper-stop-test.mp3"),
+                format: EncoderFormat::Mp3,
+                file_name: "capture.mp3".to_string(),
+                byte_len: 1,
+            })
+        });
+
+        let session = RecordingSession {
+            stream: None,
+            sender: None,
+            worker: Some(worker),
+            level: Arc::new(AtomicU32::new(0)),
+            captured_samples: Arc::new(AtomicU64::new(1_600)),
+            started_at: Instant::now(),
+            device_name: "Mock Mic".to_string(),
+            input_sample_rate: 16_000,
+            input_channels: 1,
+        };
+
+        let stop_started = Instant::now();
+        let recording = session.stop().expect("stop mock recording");
+        let total_elapsed = stop_started.elapsed();
+
+        assert!(
+            recording.duration < Duration::from_millis(150),
+            "capture duration must exclude encoder finalize: {:?}",
+            recording.duration
+        );
+        assert!(
+            total_elapsed >= Duration::from_millis(200),
+            "test worker must actually delay finalization: {total_elapsed:?}"
+        );
+        assert_eq!(recording.captured_samples, 1_600);
+    }
 }

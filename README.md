@@ -35,6 +35,7 @@
 | `curl`, `jq` | 必須 | API スモークテストや応答確認に使用します。 |
 | `just` | 任意 | `justfile` のレシピを使う場合に導入します。 |
 | `cargo-machete` | 任意 | `just machete` / `just quality` で未使用依存を確認する場合に導入します。 |
+| テスト用音声 | 任意 | `just verify-local` のスモーク用です。未配置なら `scripts/create-fixture.sh` が決定的な短い音声を自動生成します。実 API の文字起こし確認には発話を含む音声を用意してください。 |
 | Groq API キー | 必須 | 文字起こし API の呼び出しに必要です。 |
 | マイク入力環境 | 必須 | PipeWire / PulseAudio / ALSA のいずれかを前提とします。 |
 | X11 または Wayland セッション | 必須 | GUI 表示とクリップボード連携に必要です。 |
@@ -81,7 +82,19 @@ cargo install just --locked
 cargo install cargo-machete --locked
 ```
 
-### 3. API キーの設定
+### 3. テスト用音声 fixture の準備
+
+`just verify-local` のスモークテストは `data/test_rec.mp3` を使用します。リポジトリには音声ファイルを含めていないため、未配置の場合は次のコマンドで決定的な短い MP3 を生成できます。
+
+```bash
+just fixture
+# または
+bash scripts/create-fixture.sh
+```
+
+`just verify-local` と `scripts/smoke-encode.sh` は、既定の fixture が無い場合に自動生成します。生成音声はエンコード経路の確認用であり、実 API の文字起こし品質確認には発話を含む音声を指定してください。
+
+### 4. API キーの設定
 
 最低限、以下を設定してください。
 

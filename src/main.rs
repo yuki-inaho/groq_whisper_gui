@@ -1,21 +1,9 @@
-mod app;
-mod audio;
-mod config;
-mod encoder;
-#[cfg(test)]
-mod fixture;
-mod hotkey;
-mod hotkey_listener;
-mod persistence;
-mod transcriber;
-mod ui;
-mod usage;
-
 use anyhow::Result;
 use clap::Parser;
-use config::{AppConfig, CliArgs, UiMode};
 use eframe::egui;
-use persistence::StoredAppState;
+use groq_whisper_app::app::VoiceDeskApp;
+use groq_whisper_app::config::{AppConfig, CliArgs, UiMode};
+use groq_whisper_app::persistence::{self, StoredAppState};
 
 fn build_native_options(config: &AppConfig) -> eframe::NativeOptions {
     let (width, height) = match config.ui_mode {
@@ -34,7 +22,15 @@ fn build_native_options(config: &AppConfig) -> eframe::NativeOptions {
 
 fn main() -> Result<()> {
     let cli = CliArgs::parse();
-    let stored = persistence::load_state().unwrap_or_else(|_| StoredAppState::default());
+    let stored = match persistence::load_state() {
+        Ok(state) => state,
+        Err(error) => {
+            eprintln!(
+                "[groq-whisper-app] 永続設定を読み込めませんでした。既定値で起動します: {error:#}"
+            );
+            StoredAppState::default()
+        }
+    };
     let config = AppConfig::from_sources(cli, &stored)?;
 
     // 起動時に明示的な選択値をログへ出力する (暗黙 fallback 禁止 / 監査トレーサビリティ)。
@@ -50,8 +46,7 @@ fn main() -> Result<()> {
         "Groq Whisper 文字起こし",
         native_options,
         Box::new(move |cc| {
-            Box::new(app::VoiceDeskApp::new(cc, config.clone(), stored.clone()))
-                as Box<dyn eframe::App>
+            Box::new(VoiceDeskApp::new(cc, config.clone(), stored.clone())) as Box<dyn eframe::App>
         }),
     )
     .map_err(|error| anyhow::anyhow!("eframe error: {error}"))
