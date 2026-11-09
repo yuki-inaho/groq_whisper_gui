@@ -182,6 +182,7 @@ impl VoiceDeskApp {
         let recording_duration = job.recording.duration;
         let model = job.model.clone();
         self.transcript_text = job.transcript.text.clone();
+        // 成功した CompletedJob だけがここへ到達する。転写失敗や手動コピーでは進めない。
         self.result_index = Some(advance_result_index(self.result_index));
 
         let copied_to_clipboard = if self.config.copy_to_clipboard {
@@ -1055,7 +1056,12 @@ fn draw_status_indicator(
     level: f32,
     result_index: Option<u64>,
     status_text: &str,
-) {
+) -> StatusIndicatorRects {
+    let mut rects = StatusIndicatorRects {
+        status: egui::Rect::NOTHING,
+        result: egui::Rect::NOTHING,
+    };
+
     ui.horizontal(|ui| {
         let size = egui::vec2(18.0, 18.0);
 
@@ -1066,7 +1072,31 @@ fn draw_status_indicator(
             .on_hover_text(format!("録音レベル: {:.0}%", level.clamp(0.0, 1.0) * 100.0));
 
         ui.label(":");
-        ui.add(egui::Label::new(egui::RichText::new(status_text).strong()).wrap(true));
+
+        // 右端バッジの実幅を先に測り、ステータス側の幅を逆算して確保する。
+        // right_to_left だけでは、長いステータスが確保した領域へバッジが重なる。
+        let result_label = result_indicator_label(result_index);
+        let result_font = egui::TextStyle::Body.resolve(ui.style());
+        let result_label_width = ui
+            .painter()
+            .layout_no_wrap(result_label.clone(), result_font, ui.visuals().text_color())
+            .size()
+            .x;
+        let badge_width = size.x + 6.0 + result_label_width;
+        let status_width = (ui.available_width() - badge_width - 8.0).max(60.0);
+        let status_response = ui
+            .allocate_ui_with_layout(
+                egui::vec2(status_width, size.y),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(status_text).strong()).truncate(true),
+                    )
+                },
+            )
+            .inner;
+        rects.status = status_response.rect;
+        let _ = status_response.on_hover_text(status_text);
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let (result_rect, result_response) = ui.allocate_exact_size(size, egui::Sense::hover());
@@ -1075,11 +1105,20 @@ fn draw_status_indicator(
                 7.0,
                 result_indicator_color(result_index),
             );
+            rects.result = result_rect;
             let _ = result_response.on_hover_text(result_indicator_tooltip(result_index));
             ui.add_space(6.0);
-            ui.label(egui::RichText::new(result_indicator_label(result_index)).strong());
+            ui.label(egui::RichText::new(result_label).strong());
         });
     });
+
+    rects
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StatusIndicatorRects {
+    status: egui::Rect,
+    result: egui::Rect,
 }
 
 fn level_color(level: f32) -> egui::Color32 {
@@ -1385,6 +1424,44 @@ mod tests {
         assert_eq!(result_indicator_label(None), "#--");
         assert!(result_indicator_tooltip(None).contains("まだありません"));
         assert!(result_indicator_tooltip(Some(3)).contains("#3"));
+    }
+
+    #[test]
+    fn long_status_does_not_overlap_result_badge() {
+        let ctx = egui::Context::default();
+        let mut rects = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(430.0, 300.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    rects = Some(draw_status_indicator(
+                        ui,
+                        0.1,
+                        Some(123_456_789),
+                        "文字起こし完了。長いステータスメッセージが表示されている状態です",
+                    ));
+                });
+            },
+        );
+
+        let rects = rects.expect("status indicator must be laid out");
+        assert!(
+            rects.status.right() <= rects.result.left() + 0.5,
+            "status and result badge overlap: status={:?}, result={:?}",
+            rects.status,
+            rects.result
+        );
+        assert!(
+            rects.result.right() <= 430.0,
+            "result badge must stay inside the window: {:?}",
+            rects.result
+        );
     }
 
     #[test]
