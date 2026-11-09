@@ -17,6 +17,7 @@ help:
       '' \
       'First run:' \
       '  just doctor                         # required tools and fixture checks' \
+      '  just fixture                        # generate data/test_rec.mp3 when missing' \
       '  just verify-local                   # full local verification, no API key required' \
       '' \
       'Daily development:' \
@@ -37,7 +38,7 @@ help:
       'Reference:'
     @printf '%s\n' '  recipe list: just --list'
 
-# 開発前の環境確認。Rust と外部 CLI、fixture の存在だけを短時間で見る。
+# 開発前の環境確認。Rust と外部 CLI の存在を確認し、fixture は欠落時のみ案内する。
 doctor:
     @missing=0; \
     for cmd in cargo cargo-machete ffmpeg lame ffprobe curl jq; do \
@@ -51,10 +52,13 @@ doctor:
     if [ -f data/test_rec.mp3 ]; then \
       printf 'ok: data/test_rec.mp3 exists\n'; \
     else \
-      printf 'missing: data/test_rec.mp3\n' >&2; \
-      missing=1; \
+      printf 'info: data/test_rec.mp3 is missing; verify-local generates it automatically (or run: just fixture)\n'; \
     fi; \
     exit "$missing"
+
+# スモークテスト用の決定的な音声 fixture を生成する (既存なら再利用)。
+fixture output="data/test_rec.mp3":
+    bash scripts/create-fixture.sh "{{output}}"
 
 # フォーマット適用
 fmt:

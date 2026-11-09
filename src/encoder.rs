@@ -414,6 +414,14 @@ mod tests {
     use super::*;
     use std::process::Command;
 
+    fn ffmpeg_bin() -> String {
+        std::env::var("GROQ_FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_string())
+    }
+
+    fn ffprobe_bin() -> String {
+        std::env::var("GROQ_FFPROBE_PATH").unwrap_or_else(|_| "ffprobe".to_string())
+    }
+
     #[test]
     fn creates_unique_mp3_path_in_temp_dir() {
         let dir = std::env::temp_dir().join("groq-whisper-tests");
@@ -433,7 +441,7 @@ mod tests {
     /// 16 kHz / mono / 48 kbps MP3 を生成する想定の raw PCM を、
     /// 実機の `/usr/bin/lame` に pipe して `ffprobe` で検証する。
     ///
-    /// `#[ignore]` 理由: 実行時に `/usr/bin/lame` と `/usr/local/bin/ffprobe` を
+    /// `#[ignore]` 理由: 実行時に `lame` と `ffprobe` を
     /// 必要とするため、普通の `cargo test` では skip し、手順 22
     /// (smoke-encode) と同じタイミングで `cargo test -- --ignored` から
     /// 実行する。CI 環境に lame/ffprobe が無い場合は明示的 fail させる。
@@ -496,7 +504,7 @@ mod tests {
         assert!(output_path.exists(), "output file must exist");
 
         // ffprobe で MP3 メタデータを検証
-        let probe = Command::new("/usr/local/bin/ffprobe")
+        let probe = Command::new(ffprobe_bin())
             .arg("-v")
             .arg("error")
             .arg("-of")
@@ -530,18 +538,18 @@ mod tests {
         assert!(has_bitrate, "expected bit_rate near 48000, got: {stdout}");
     }
 
-    /// 手順 15: 本環境の `/usr/local/bin/ffmpeg` が `libmp3lame` 非対応である
-    /// ことを想定し、既定引数で `FfmpegMp3Encoder` を走らせたときに
-    /// `anyhow!("ffmpeg does not support libmp3lame ...")` 形式の明示的エラーが
-    /// 返ることを確認する。暗黙 fallback (lame へ自動切替) していないことも
-    /// エラー内容で保証する。
+    /// libmp3lame の有無に依存せず、ffmpeg バックエンドの契約を検証する。
     ///
-    /// `#[ignore]` 理由: `--enable-libmp3lame` 付き ffmpeg を使っている環境では
-    /// 成功してしまうので、フレーキー回避のため ignored。手順 22 のタイミングで
-    /// `cargo test -- --ignored` 経由で実行する (本環境は non-libmp3lame なので pass)。
+    /// - libmp3lame 対応ビルド: 有効な非空 MP3 を生成する。
+    /// - 非対応ビルド: libmp3lame と `--mp3-encoder lame` を含む明示的エラーを返す。
+    ///
+    /// どちらの場合も、lame バックエンドへ暗黙に切り替わっていないことを保証する。
+    ///
+    /// `#[ignore]` 理由: 実機の ffmpeg を spawn するため。`cargo test -- --ignored`
+    /// または `just verify-local` で実行する。
     #[test]
     #[ignore]
-    fn ffmpeg_backend_reports_libmp3lame_failure_explicitly() {
+    fn ffmpeg_backend_succeeds_or_reports_libmp3lame_failure_without_fallback() {
         let temp_dir = std::env::temp_dir().join("groq-whisper-tests-ffmpeg-lame");
         fs::create_dir_all(&temp_dir).expect("create temp dir");
         let output_path = temp_dir.join("ffmpeg_backend_reports_libmp3lame_failure.mp3");
@@ -552,7 +560,7 @@ mod tests {
         let settings = EncoderSettings {
             format: EncoderFormat::Mp3,
             mp3_encoder: Mp3EncoderBackend::Ffmpeg,
-            ffmpeg_path: "/usr/local/bin/ffmpeg".to_string(),
+            ffmpeg_path: ffmpeg_bin(),
             ffmpeg_extra_args: Vec::new(),
             lame_path: "/usr/bin/lame".to_string(),
             gpu_offload: GpuOffloadMode::Off,
@@ -569,24 +577,33 @@ mod tests {
 
         let mut encoder: Box<dyn StreamingEncoder> = Box::new(
             FfmpegMp3Encoder::new(&settings, input_spec, output_path.clone())
-                .expect("spawn ffmpeg. Ensure /usr/local/bin/ffmpeg exists."),
+                .expect("spawn ffmpeg. Ensure ffmpeg is in PATH or set GROQ_FFMPEG_PATH."),
         );
 
-        let silent: Vec<i16> = vec![0; 1_000];
+        let silent: Vec<i16> = vec![0; 48_000];
         let _ = encoder.write_samples(&silent);
 
-        let err = encoder
-            .finish()
-            .expect_err("ffmpeg without libmp3lame must fail explicitly");
-        let message = format!("{err:#}");
-        assert!(
-            message.contains("libmp3lame"),
-            "expected error to mention libmp3lame, got: {message}"
-        );
-        assert!(
-            message.contains("--mp3-encoder lame"),
-            "expected error to suggest --mp3-encoder lame, got: {message}"
-        );
+        match encoder.finish() {
+            Ok(encoded) => {
+                assert_eq!(encoded.format, EncoderFormat::Mp3);
+                assert!(
+                    encoded.byte_len > 0,
+                    "ffmpeg success must produce a non-empty MP3"
+                );
+                assert!(output_path.exists(), "ffmpeg output file must exist");
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                assert!(
+                    message.contains("libmp3lame"),
+                    "expected explicit libmp3lame error, got: {message}"
+                );
+                assert!(
+                    message.contains("--mp3-encoder lame"),
+                    "expected error to suggest --mp3-encoder lame, got: {message}"
+                );
+            }
+        }
     }
 
     /// 手順 15: 不正な codec 名で `FfmpegMp3Encoder` を走らせ、stderr の中身が
@@ -596,7 +613,7 @@ mod tests {
     /// ffmpeg 側の codec 指定を強制的に上書きし、`Unknown encoder` を意図的に
     /// 発生させる (暗黙 fallback が起きていないことを確認するための negative test)。
     ///
-    /// `#[ignore]` 理由: 実機の `/usr/local/bin/ffmpeg` を spawn するため、
+    /// `#[ignore]` 理由: 実機の ffmpeg を spawn するため、
     /// CI で ffmpeg が無い場合のフレーキーを避ける。手順 22 のタイミングで
     /// `cargo test -- --ignored` 経由で実行する。
     #[test]
@@ -612,7 +629,7 @@ mod tests {
         let settings = EncoderSettings {
             format: EncoderFormat::Mp3,
             mp3_encoder: Mp3EncoderBackend::Ffmpeg,
-            ffmpeg_path: "/usr/local/bin/ffmpeg".to_string(),
+            ffmpeg_path: ffmpeg_bin(),
             // 最後の -codec:a で上書きして Unknown encoder を誘発する
             ffmpeg_extra_args: vec!["-codec:a".to_string(), "nonexistent_codec".to_string()],
             lame_path: "/usr/bin/lame".to_string(),
@@ -630,7 +647,7 @@ mod tests {
 
         let mut encoder: Box<dyn StreamingEncoder> = Box::new(
             FfmpegMp3Encoder::new(&settings, input_spec, output_path.clone())
-                .expect("spawn ffmpeg. Ensure /usr/local/bin/ffmpeg exists."),
+                .expect("spawn ffmpeg. Ensure ffmpeg is in PATH or set GROQ_FFMPEG_PATH."),
         );
 
         // 短い無音バッファを書き込む (1 チャンクで十分)

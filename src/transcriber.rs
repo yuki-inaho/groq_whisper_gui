@@ -1,6 +1,6 @@
 use crate::config::ResponseFormat;
 use crate::encoder::EncodedAudio;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use reqwest::blocking::multipart::{Form, Part};
 use serde_json::Value;
 use std::fs::File;
@@ -79,11 +79,19 @@ pub fn transcribe_file(
         .bearer_auth(&config.api_key)
         .multipart(form)
         .send()
-        .context("failed to call Groq transcription endpoint")?
-        .error_for_status()
-        .context("Groq transcription request returned an error")?;
+        .context("failed to call Groq transcription endpoint")?;
 
+    let status = response.status();
     let body = response.text().context("failed to read response body")?;
+
+    if !status.is_success() {
+        let detail = body.trim();
+        if detail.is_empty() {
+            bail!("Groq transcription request failed with HTTP {status}");
+        }
+        bail!("Groq transcription request failed with HTTP {status}: {detail}");
+    }
+
     parse_transcription_response(config.response_format, body, started_at.elapsed())
 }
 

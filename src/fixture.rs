@@ -197,6 +197,25 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    fn generate_fixture_wav(path: &std::path::Path) {
+        let spec = hound::WavSpec {
+            channels: FIXTURE_CHANNELS,
+            sample_rate: FIXTURE_SAMPLE_RATE_HZ,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).expect("create generated fixture");
+        let sample_rate = FIXTURE_SAMPLE_RATE_HZ as f32;
+        let amplitude = (i16::MAX as f32 * 0.25) as i16;
+        for index in 0..FIXTURE_SAMPLE_RATE_HZ {
+            let phase = std::f32::consts::TAU * 440.0 * index as f32 / sample_rate;
+            writer
+                .write_sample((phase.sin() * amplitude as f32) as i16)
+                .expect("write generated fixture sample");
+        }
+        writer.finalize().expect("finalize generated fixture");
+    }
+
     /// 手順 16 の受入テスト: `data/test_rec.mp3` を raw PCM にデコードし、
     /// 20 ms (= 960 frames @ 48 kHz mono) チャンクで `LameMp3Encoder` に流し、
     /// 次の 2 点を確認する。
@@ -210,18 +229,22 @@ mod tests {
     #[test]
     #[ignore]
     fn fixture_audio_streams_in_chunks() {
-        // data/test_rec.mp3 は repo 直下からの相対パス。cargo test の CWD は
-        // crate root なので PathBuf::from("data/test_rec.mp3") で到達可能。
+        // data/test_rec.mp3 があればそれを優先する。クリーン clone でも検証できるよう、
+        // 無い場合は同等の PCM WAV を一時生成して ffmpeg デコード経路を通す。
         let fixture = PathBuf::from("data/test_rec.mp3");
-        assert!(
-            fixture.exists(),
-            "fixture must exist at {}. Skipping via #[ignore] if absent is not sufficient; \
-             this test is wired to require the file.",
-            fixture.display()
-        );
-
         let temp_dir = std::env::temp_dir().join("groq-whisper-tests-fixture");
         fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let fixture = if fixture.exists() {
+            fixture
+        } else {
+            let generated = temp_dir.join("generated_fixture.wav");
+            generate_fixture_wav(&generated);
+            eprintln!(
+                "data/test_rec.mp3 not found; using generated fixture {}",
+                generated.display()
+            );
+            generated
+        };
 
         let settings = EncoderSettings {
             format: EncoderFormat::Mp3,

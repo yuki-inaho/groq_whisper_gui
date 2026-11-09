@@ -2,15 +2,18 @@ use crate::audio::{
     self, AudioCaptureRequest, CompletedRecording, InputDeviceInfo, RecordingSession,
 };
 use crate::config::{AppConfig, GpuOffloadMode, UiMode, WHISPER_MODEL_V3, WHISPER_MODEL_V3_TURBO};
+use crate::encoder::EncodedAudio;
 use crate::hotkey_listener::RawHotkey;
 use crate::persistence::{self, LastResultRecord, StoredAppState};
-use crate::transcriber::{self, TranscriptionResult};
+use crate::transcriber::{self, TranscriberConfig, TranscriptionResult};
 use crate::usage::{self, SessionUsage};
 use anyhow::anyhow;
 use arboard::Clipboard;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use eframe::egui;
+use std::collections::BTreeSet;
 use std::fs;
+use std::path::Path;
 use std::time::Duration;
 
 pub struct VoiceDeskApp {
@@ -41,9 +44,20 @@ enum UiStatus {
     Error(String),
 }
 
+/// 設定画面から変更できる項目。永続化はこの単位で行い、CLI や環境変数による
+/// 一時的な上書きを `state.json` へ漏らさない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PreferenceField {
+    UiMode,
+    InputDevice,
+    Model,
+    GpuOffload,
+}
+
 #[derive(Debug)]
 enum AppMessage {
     Stage(String),
+    Log(String),
     // `CompletedJob` は `CompletedRecording` + `TranscriptionResult` を保持し
     // 250 バイト程度あるため、`Stage(String)` (~24 バイト) との variant サイズ差
     // を抑える目的で `Box` で間接参照する (clippy::large_enum_variant 対策)。
@@ -146,6 +160,9 @@ impl VoiceDeskApp {
                     self.status = UiStatus::Processing(stage.clone());
                     self.append_log(stage);
                 }
+                AppMessage::Log(message) => {
+                    self.append_log(message);
+                }
                 AppMessage::JobFinished(result) => match result {
                     Ok(job) => self.handle_completed_job(*job),
                     Err(error) => {
@@ -176,10 +193,6 @@ impl VoiceDeskApp {
             None
         };
 
-        if !self.config.keep_audio {
-            let _ = fs::remove_file(&job.recording.encoded_audio.path);
-        }
-
         let char_count = job.transcript.text.chars().count();
         let preview: String = job.transcript.text.chars().take(120).collect();
         self.persisted.last_result = Some(LastResultRecord::now(
@@ -193,7 +206,7 @@ impl VoiceDeskApp {
         self.session_usage
             .record_transcription(&model, recording_duration);
 
-        if let Err(error) = self.persist_preferences() {
+        if let Err(error) = self.persist_last_result() {
             self.append_log(format!("設定保存失敗: {error}"));
         }
 
@@ -266,17 +279,21 @@ impl VoiceDeskApp {
         }
     }
 
-    fn persist_preferences(&mut self) -> anyhow::Result<()> {
-        self.persisted.ui_mode = self.config.ui_mode;
+    /// 転写結果だけを保存する。CLI / 環境変数による実行時上書きは保存しない。
+    fn persist_last_result(&mut self) -> anyhow::Result<()> {
         self.persisted.show_settings = self.show_settings;
-        self.persisted.input_device = self.selected_device.clone();
-        self.persisted.response_format = Some(self.config.response_format);
-        self.persisted.hotkey_toggle = self.config.hotkeys.toggle.as_ref().map(ToString::to_string);
-        self.persisted.hotkey_start = self.config.hotkeys.start.as_ref().map(ToString::to_string);
-        self.persisted.hotkey_stop = self.config.hotkeys.stop.as_ref().map(ToString::to_string);
-        self.persisted.model = Some(self.config.model.clone());
-        self.persisted.gpu_offload = Some(self.config.gpu_offload);
+        persistence::save_state(&self.persisted)
+    }
 
+    /// 設定画面でユーザーが実際に変更した項目だけを保存する。
+    fn persist_preferences(&mut self, changed: &BTreeSet<PreferenceField>) -> anyhow::Result<()> {
+        apply_preference_changes(
+            &mut self.persisted,
+            &self.config,
+            self.selected_device.as_deref(),
+            changed,
+        );
+        self.persisted.show_settings = self.show_settings;
         persistence::save_state(&self.persisted)
     }
 
@@ -331,6 +348,7 @@ impl VoiceDeskApp {
 
         let tx = self.tx.clone();
         let transcriber_config = self.config.transcriber_config();
+        let keep_audio = self.config.keep_audio;
 
         self.status = UiStatus::Processing("録音停止。音声ファイルを確定しています。".to_string());
 
@@ -349,33 +367,13 @@ impl VoiceDeskApp {
         };
 
         std::thread::spawn(move || {
-            let result = (|| -> anyhow::Result<Box<CompletedJob>> {
-                let file_size_kb = recording.encoded_audio.byte_len as f64 / 1024.0;
-                let _ = tx.send(AppMessage::Stage(format!(
-                    "Groq API へ送信します: {} / {:.1} KiB / {:.2} 秒 (device: {}, sr: {} Hz, ch: {}, samples: {})",
-                    recording.encoded_audio.file_name,
-                    file_size_kb,
-                    recording.duration.as_secs_f32(),
-                    recording.device_name,
-                    recording.input_sample_rate,
-                    recording.input_channels,
-                    recording.captured_samples,
-                )));
-
-                let api = transcriber_config
-                    .ok_or_else(|| anyhow!("GROQ_API_KEY が設定されていません。"))?;
-                let model = api.model.clone();
-
-                let transcript = transcriber::transcribe_file(&api, &recording.encoded_audio)?;
-                Ok(Box::new(CompletedJob {
-                    recording,
-                    transcript,
-                    model,
-                }))
-            })()
-            .map_err(|error| error.to_string());
-
-            let _ = tx.send(AppMessage::JobFinished(result));
+            finish_transcription_job(
+                recording,
+                transcriber_config,
+                keep_audio,
+                transcriber::transcribe_file,
+                &tx,
+            );
         });
     }
 
@@ -623,7 +621,7 @@ impl VoiceDeskApp {
         }
 
         let mut open = self.show_settings;
-        let mut changed = false;
+        let mut changed = BTreeSet::new();
         let device_entries = self.devices.clone();
 
         egui::Window::new("設定")
@@ -649,7 +647,7 @@ impl VoiceDeskApp {
                             )
                             .changed()
                         {
-                            changed = true;
+                            changed.insert(PreferenceField::InputDevice);
                         }
 
                         for device in &device_entries {
@@ -661,7 +659,7 @@ impl VoiceDeskApp {
                                 )
                                 .changed()
                             {
-                                changed = true;
+                                changed.insert(PreferenceField::InputDevice);
                             }
                         }
                     });
@@ -672,13 +670,13 @@ impl VoiceDeskApp {
                     .selectable_value(&mut self.config.ui_mode, UiMode::Compact, "Compact")
                     .changed()
                 {
-                    changed = true;
+                    changed.insert(PreferenceField::UiMode);
                 }
                 if ui
                     .selectable_value(&mut self.config.ui_mode, UiMode::Debug, "Debug")
                     .changed()
                 {
-                    changed = true;
+                    changed.insert(PreferenceField::UiMode);
                 }
 
                 ui.separator();
@@ -690,7 +688,7 @@ impl VoiceDeskApp {
                                 .selectable_value(&mut self.config.model, model.to_string(), label)
                                 .changed()
                             {
-                                changed = true;
+                                changed.insert(PreferenceField::Model);
                             }
                         }
                     });
@@ -707,7 +705,7 @@ impl VoiceDeskApp {
                                 )
                                 .changed()
                             {
-                                changed = true;
+                                changed.insert(PreferenceField::GpuOffload);
                             }
                         }
                     });
@@ -735,8 +733,8 @@ impl VoiceDeskApp {
             });
 
         self.show_settings = open;
-        if changed {
-            if let Err(error) = self.persist_preferences() {
+        if !changed.is_empty() {
+            if let Err(error) = self.persist_preferences(&changed) {
                 self.append_log(format!("設定保存失敗: {error}"));
             }
         }
@@ -843,6 +841,83 @@ impl eframe::App for VoiceDeskApp {
         self.draw_settings_window(ctx);
         self.draw_exit_summary_window(ctx);
         ctx.request_repaint_after(Duration::from_millis(33));
+    }
+}
+
+/// 転写ジョブのワーカー本体。GUI から独立してテストできるよう、HTTP 呼び出しを
+/// 関数引数として受け取る。`keep_audio=false` のときは成功・失敗に関わらず
+/// 一時音声ファイルを削除し、削除自体の失敗だけをログへ残す。
+fn finish_transcription_job<F>(
+    recording: CompletedRecording,
+    transcriber_config: Option<TranscriberConfig>,
+    keep_audio: bool,
+    transcribe: F,
+    tx: &Sender<AppMessage>,
+) where
+    F: FnOnce(&TranscriberConfig, &EncodedAudio) -> anyhow::Result<TranscriptionResult>,
+{
+    let cleanup_path = recording.encoded_audio.path.clone();
+    let result = (|| -> anyhow::Result<Box<CompletedJob>> {
+        let file_size_kb = recording.encoded_audio.byte_len as f64 / 1024.0;
+        let _ = tx.send(AppMessage::Stage(format!(
+            "Groq API へ送信します: {} / {:.1} KiB / {:.2} 秒 (device: {}, sr: {} Hz, ch: {}, samples: {})",
+            recording.encoded_audio.file_name,
+            file_size_kb,
+            recording.duration.as_secs_f32(),
+            recording.device_name,
+            recording.input_sample_rate,
+            recording.input_channels,
+            recording.captured_samples,
+        )));
+
+        let api =
+            transcriber_config.ok_or_else(|| anyhow!("GROQ_API_KEY が設定されていません。"))?;
+        let model = api.model.clone();
+
+        let transcript = transcribe(&api, &recording.encoded_audio)?;
+        Ok(Box::new(CompletedJob {
+            recording,
+            transcript,
+            model,
+        }))
+    })()
+    .map_err(|error| error.to_string());
+
+    if !keep_audio {
+        if let Err(error) = cleanup_audio_file(&cleanup_path) {
+            let _ = tx.send(AppMessage::Log(format!(
+                "一時音声ファイルを削除できませんでした: {} ({error})",
+                cleanup_path.display()
+            )));
+        }
+    }
+
+    let _ = tx.send(AppMessage::JobFinished(result));
+}
+
+fn cleanup_audio_file(path: &Path) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn apply_preference_changes(
+    persisted: &mut StoredAppState,
+    config: &AppConfig,
+    selected_device: Option<&str>,
+    changed: &BTreeSet<PreferenceField>,
+) {
+    for field in changed {
+        match field {
+            PreferenceField::UiMode => persisted.ui_mode = config.ui_mode,
+            PreferenceField::InputDevice => {
+                persisted.input_device = selected_device.map(str::to_owned);
+            }
+            PreferenceField::Model => persisted.model = Some(config.model.clone()),
+            PreferenceField::GpuOffload => persisted.gpu_offload = Some(config.gpu_offload),
+        }
     }
 }
 
@@ -986,6 +1061,171 @@ fn is_quit_key(key: egui::Key) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{CliArgs, EncoderFormat};
+    use clap::Parser;
+
+    fn test_transcriber_config() -> TranscriberConfig {
+        TranscriberConfig {
+            api_key: "test-key".to_string(),
+            base_url: "http://127.0.0.1:1".to_string(),
+            model: WHISPER_MODEL_V3_TURBO.to_string(),
+            language: Some("ja".to_string()),
+            prompt: None,
+            response_format: crate::config::ResponseFormat::Json,
+            temperature: 0.0,
+            word_timestamps: false,
+            segment_timestamps: false,
+            request_timeout_secs: 1,
+        }
+    }
+
+    fn sample_recording(path: &Path) -> CompletedRecording {
+        fs::write(path, b"mock audio").expect("write mock audio");
+        CompletedRecording {
+            device_name: "Mock Mic".to_string(),
+            input_sample_rate: 16_000,
+            input_channels: 1,
+            captured_samples: 1_600,
+            duration: Duration::from_millis(100),
+            encoded_audio: EncodedAudio {
+                path: path.to_path_buf(),
+                format: EncoderFormat::Mp3,
+                file_name: "capture.mp3".to_string(),
+                byte_len: 10,
+            },
+        }
+    }
+
+    fn temp_audio_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "groq-whisper-app-test-{label}-{}-{}.mp3",
+            std::process::id(),
+            chrono::Local::now()
+                .timestamp_nanos_opt()
+                .unwrap_or_default()
+        ))
+    }
+
+    #[test]
+    fn preference_persistence_only_applies_explicit_ui_changes() {
+        let stored = StoredAppState {
+            ui_mode: UiMode::Compact,
+            input_device: Some("Built-in Mic".to_string()),
+            hotkey_toggle: Some("Space".to_string()),
+            model: Some(WHISPER_MODEL_V3.to_string()),
+            gpu_offload: Some(GpuOffloadMode::Off),
+            ..StoredAppState::default()
+        };
+        let cli = CliArgs::parse_from([
+            "voice-app",
+            "--ui-mode",
+            "debug",
+            "--input-device",
+            "USB Mic",
+            "--model",
+            WHISPER_MODEL_V3_TURBO,
+            "--gpu-offload",
+            "cuda",
+            "--start-hotkey",
+            "Ctrl+S",
+            "--stop-hotkey",
+            "Ctrl+E",
+        ]);
+        let config = AppConfig::from_sources(cli, &stored).unwrap();
+        let mut persisted = stored.clone();
+
+        apply_preference_changes(
+            &mut persisted,
+            &config,
+            Some("USB Mic"),
+            &BTreeSet::from([PreferenceField::UiMode, PreferenceField::Model]),
+        );
+
+        // 明示的に変更した 2 項目だけが反映される。
+        assert_eq!(persisted.ui_mode, UiMode::Debug);
+        assert_eq!(persisted.model.as_deref(), Some(WHISPER_MODEL_V3_TURBO));
+        // CLI 由来の他項目は保存されない。
+        assert_eq!(persisted.input_device.as_deref(), Some("Built-in Mic"));
+        assert_eq!(persisted.gpu_offload, Some(GpuOffloadMode::Off));
+        assert_eq!(persisted.hotkey_toggle.as_deref(), Some("Space"));
+        assert!(persisted.hotkey_start.is_none());
+        assert!(persisted.hotkey_stop.is_none());
+    }
+
+    #[test]
+    fn failed_transcription_removes_temporary_audio_when_not_kept() {
+        let path = temp_audio_path("cleanup-failure");
+        let recording = sample_recording(&path);
+        let (tx, rx) = unbounded();
+
+        finish_transcription_job(
+            recording,
+            Some(test_transcriber_config()),
+            false,
+            |_, _| Err(anyhow!("mock transcription failure")),
+            &tx,
+        );
+
+        assert!(!path.exists(), "failed job must remove temporary audio");
+        let messages: Vec<AppMessage> = rx.try_iter().collect();
+        assert!(matches!(messages.first(), Some(AppMessage::Stage(_))));
+        assert!(matches!(
+            messages.last(),
+            Some(AppMessage::JobFinished(Err(_)))
+        ));
+    }
+
+    #[test]
+    fn failed_transcription_keeps_temporary_audio_when_requested() {
+        let path = temp_audio_path("keep-failure");
+        let recording = sample_recording(&path);
+        let (tx, _rx) = unbounded();
+
+        finish_transcription_job(
+            recording,
+            Some(test_transcriber_config()),
+            true,
+            |_, _| Err(anyhow!("mock transcription failure")),
+            &tx,
+        );
+
+        assert!(path.exists(), "keep_audio=true must retain the file");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn successful_transcription_removes_temporary_audio_and_returns_job() {
+        let path = temp_audio_path("cleanup-success");
+        let recording = sample_recording(&path);
+        let (tx, rx) = unbounded();
+
+        finish_transcription_job(
+            recording,
+            Some(test_transcriber_config()),
+            false,
+            |_, _| {
+                Ok(TranscriptionResult {
+                    text: "テスト".to_string(),
+                    request_id: Some("req_test".to_string()),
+                    raw_response: None,
+                    elapsed: Duration::from_millis(5),
+                })
+            },
+            &tx,
+        );
+
+        assert!(!path.exists(), "successful job must remove temporary audio");
+        let messages: Vec<AppMessage> = rx.try_iter().collect();
+        let completed = messages
+            .iter()
+            .find_map(|message| match message {
+                AppMessage::JobFinished(Ok(job)) => Some(job),
+                _ => None,
+            })
+            .expect("successful job must be reported");
+        assert_eq!(completed.transcript.text, "テスト");
+        assert_eq!(completed.transcript.request_id.as_deref(), Some("req_test"));
+    }
 
     #[test]
     fn quit_keys_are_escape_and_q() {

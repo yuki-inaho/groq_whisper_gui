@@ -71,10 +71,7 @@ fn install_system_cjk_font(ctx: &egui::Context) -> Option<PathBuf> {
     }
 
     ctx.set_fonts(fonts);
-    eprintln!(
-        "[groq-whisper-app] loaded UI font {}",
-        font_path.display()
-    );
+    eprintln!("[groq-whisper-app] loaded UI font {}", font_path.display());
     Some(font_path)
 }
 
