@@ -28,6 +28,14 @@ use crate::encoder::StreamingEncoder;
 pub const FIXTURE_SAMPLE_RATE_HZ: u32 = 48_000;
 pub const FIXTURE_CHANNELS: u16 = 1;
 
+fn ffmpeg_bin() -> String {
+    std::env::var("GROQ_FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_string())
+}
+
+fn lame_bin() -> String {
+    std::env::var("GROQ_LAME_PATH").unwrap_or_else(|_| "lame".to_string())
+}
+
 /// `fixture_path` の音声ファイルを ffmpeg で raw PCM (s16le / 48 kHz / mono) に
 /// デコードし、`chunk_frames` サンプル単位で `encoder.write_samples` に投入する。
 ///
@@ -62,7 +70,7 @@ pub fn stream_fixture_through_encoder(
     // ffmpeg を明示引数で起動し、stdout に raw PCM (s16le / 48 kHz / mono) を流す。
     // loglevel=error + hide_banner で余計な出力を抑え、stderr は失敗時の診断用に
     // キャプチャする。
-    let mut child = Command::new("ffmpeg")
+    let mut child = Command::new(ffmpeg_bin())
         .arg("-hide_banner")
         .arg("-loglevel")
         .arg("error")
@@ -251,12 +259,13 @@ mod tests {
             mp3_encoder: Mp3EncoderBackend::Lame,
             ffmpeg_path: "ffmpeg".to_string(),
             ffmpeg_extra_args: Vec::new(),
-            lame_path: "/usr/bin/lame".to_string(),
+            lame_path: lame_bin(),
             gpu_offload: GpuOffloadMode::Off,
             temp_dir: temp_dir.clone(),
             bitrate_kbps: 48,
             output_sample_rate: 16_000,
             output_channels: 1,
+            keep_audio: false,
         };
 
         let input_spec = AudioInputSpec {

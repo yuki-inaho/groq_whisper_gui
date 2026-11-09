@@ -1,6 +1,9 @@
 //! 結合テスト共通の一時ディレクトリと音声 fixture。
 //!
 //! 実マイク・外部 CLI・実 API を使わず、各シナリオが同じ手順で再現できるようにする。
+//! テスト target ごとに利用する helper が異なるため、未使用 helper の警告は抑止する。
+
+#![allow(dead_code)]
 
 use groq_whisper_app::config::{EncoderFormat, GpuOffloadMode, Mp3EncoderBackend};
 use groq_whisper_app::encoder::{create_encoder, AudioInputSpec, EncodedAudio, EncoderSettings};
@@ -40,12 +43,13 @@ pub fn encoder_settings(temp_dir: &Path, format: EncoderFormat) -> EncoderSettin
         mp3_encoder: Mp3EncoderBackend::Lame,
         ffmpeg_path: "ffmpeg".to_string(),
         ffmpeg_extra_args: Vec::new(),
-        lame_path: "/usr/bin/lame".to_string(),
+        lame_path: std::env::var("GROQ_LAME_PATH").unwrap_or_else(|_| "lame".to_string()),
         gpu_offload: GpuOffloadMode::Off,
         temp_dir: temp_dir.to_path_buf(),
         bitrate_kbps: 48,
         output_sample_rate: 16_000,
         output_channels: 1,
+        keep_audio: false,
     }
 }
 

@@ -195,14 +195,17 @@ impl VoiceDeskApp {
 
         let char_count = job.transcript.text.chars().count();
         let preview: String = job.transcript.text.chars().take(120).collect();
-        self.persisted.last_result = Some(LastResultRecord::now(
-            preview,
-            char_count,
-            model.clone(),
-            request_id.clone(),
-            copied_to_clipboard,
-            audio_path,
-        ));
+        apply_last_result(
+            &mut self.persisted,
+            LastResultRecord::now(
+                preview,
+                char_count,
+                model.clone(),
+                request_id.clone(),
+                copied_to_clipboard,
+                audio_path,
+            ),
+        );
         self.session_usage
             .record_transcription(&model, recording_duration);
 
@@ -279,9 +282,9 @@ impl VoiceDeskApp {
         }
     }
 
-    /// 転写結果だけを保存する。CLI / 環境変数による実行時上書きは保存しない。
+    /// 転写結果だけを保存する。CLI / 環境変数による実行時上書きや、設定画面の
+    /// 表示状態は保存しない。
     fn persist_last_result(&mut self) -> anyhow::Result<()> {
-        self.persisted.show_settings = self.show_settings;
         persistence::save_state(&self.persisted)
     }
 
@@ -293,8 +296,21 @@ impl VoiceDeskApp {
             self.selected_device.as_deref(),
             changed,
         );
-        self.persisted.show_settings = self.show_settings;
         persistence::save_state(&self.persisted)
+    }
+
+    /// ユーザー操作で設定画面の表示状態が変わった時だけ保存する。
+    /// 起動時の `--show-settings` は実行時上書きであり、永続値へは反映しない。
+    fn set_show_settings(&mut self, show: bool) {
+        if self.show_settings == show {
+            return;
+        }
+
+        self.show_settings = show;
+        self.persisted.show_settings = show;
+        if let Err(error) = persistence::save_state(&self.persisted) {
+            self.append_log(format!("設定保存失敗: {error}"));
+        }
     }
 
     fn append_log(&mut self, message: String) {
@@ -547,7 +563,7 @@ impl VoiceDeskApp {
                 }
 
                 if ui.button("設定").clicked() {
-                    self.show_settings = true;
+                    self.set_show_settings(true);
                 }
 
                 if ui
@@ -732,7 +748,9 @@ impl VoiceDeskApp {
                 ));
             });
 
-        self.show_settings = open;
+        if open != self.show_settings {
+            self.set_show_settings(open);
+        }
         if !changed.is_empty() {
             if let Err(error) = self.persist_preferences(&changed) {
                 self.append_log(format!("設定保存失敗: {error}"));
@@ -901,6 +919,10 @@ fn cleanup_audio_file(path: &Path) -> std::io::Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+fn apply_last_result(persisted: &mut StoredAppState, record: LastResultRecord) {
+    persisted.last_result = Some(record);
 }
 
 fn apply_preference_changes(
@@ -1150,6 +1172,40 @@ mod tests {
         assert_eq!(persisted.hotkey_toggle.as_deref(), Some("Space"));
         assert!(persisted.hotkey_start.is_none());
         assert!(persisted.hotkey_stop.is_none());
+    }
+
+    #[test]
+    fn last_result_update_does_not_change_preferences_or_visibility() {
+        let stored = StoredAppState {
+            ui_mode: UiMode::Debug,
+            show_settings: false,
+            input_device: Some("Built-in Mic".to_string()),
+            hotkey_toggle: Some("Space".to_string()),
+            model: Some(WHISPER_MODEL_V3.to_string()),
+            gpu_offload: Some(GpuOffloadMode::Off),
+            ..StoredAppState::default()
+        };
+        let mut persisted = stored.clone();
+
+        apply_last_result(
+            &mut persisted,
+            LastResultRecord::now(
+                "preview".to_string(),
+                7,
+                WHISPER_MODEL_V3_TURBO.to_string(),
+                Some("req_test".to_string()),
+                true,
+                None,
+            ),
+        );
+
+        assert!(persisted.last_result.is_some());
+        assert_eq!(persisted.ui_mode, stored.ui_mode);
+        assert_eq!(persisted.show_settings, stored.show_settings);
+        assert_eq!(persisted.input_device, stored.input_device);
+        assert_eq!(persisted.hotkey_toggle, stored.hotkey_toggle);
+        assert_eq!(persisted.model, stored.model);
+        assert_eq!(persisted.gpu_offload, stored.gpu_offload);
     }
 
     #[test]
